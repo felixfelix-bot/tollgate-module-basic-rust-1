@@ -150,6 +150,8 @@ fn expire_flushes_final_value() {
             metric: "bytes".into(),
             expiry: now() - 1,
             granted_at: now() - 100,
+            retail_allotment: now() - 100,
+            channel_id: None,
         })
         .unwrap();
     }

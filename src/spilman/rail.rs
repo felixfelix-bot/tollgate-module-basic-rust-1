@@ -108,6 +108,20 @@ impl SpilmanRail {
     }
 
     /// Bytes per millisat in use (both directions).
+    /// Bytes of access a given **raw channel balance** buys at this rail's rate.
+    ///
+    /// The access path needs the inverse of `authorize_bytes`: it holds a verified
+    /// balance and must turn it into an `allotment`. Floored to whole steps by
+    /// `allotment_bytes_for`, which is the same rule the retail path uses — what
+    /// cannot pay for a full step buys nothing, rather than buying a fraction of one.
+    ///
+    /// Returns `Err` when the raw balance cannot be converted (wrong unit), so a
+    /// caller cannot silently treat an unconvertible balance as zero credit.
+    pub fn bytes_for_raw_balance(&self, raw_balance: u64) -> Result<u64, SpilmanError> {
+        let millisats = raw_units_to_msats(RAIL_UNIT, raw_balance)?;
+        Ok(self.pricing.bytes_for_millisats(millisats))
+    }
+
     pub fn in_bytes_per_millisat(&self) -> u64 {
         self.pricing.in_bytes_per_millisat
     }

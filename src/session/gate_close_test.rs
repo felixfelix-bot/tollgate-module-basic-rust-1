@@ -46,6 +46,8 @@ mod sweep_tests {
             metric: "bytes".to_string(),
             expiry,
             granted_at: expiry.saturating_sub(600),
+            retail_allotment: expiry.saturating_sub(600),
+            channel_id: None,
         }
     }
 

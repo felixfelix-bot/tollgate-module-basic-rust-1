@@ -104,6 +104,19 @@ impl SessionPricing {
         )?)
     }
 
+    /// Bytes of access a given millisat budget buys — the inverse of
+    /// [`Self::amount_due_millisats`], and the only place the access path is allowed to
+    /// turn money into an `allotment`.
+    ///
+    /// Continuous, not floored to steps: this is the millisat model, and it is the same
+    /// conversion `authorize_bytes` performs in the other direction, so the sweep and
+    /// the authorisation check can never disagree about the rate. The multiply uses
+    /// u128 and saturates, because a large balance must not wrap into a small ceiling.
+    pub fn bytes_for_millisats(&self, millisats: u64) -> u64 {
+        let bytes = u128::from(millisats) * u128::from(self.in_bytes_per_millisat);
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
     /// The raw (channel-unit) balance the payer must sign, rounded **up**.
     pub fn raw_balance_due(
         &self,

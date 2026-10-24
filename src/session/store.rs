@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use super::CustomerSession;
 
 /// Current on-disk schema. Bump when the layout changes, and add a migration.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -121,11 +121,38 @@ impl SessionStore {
         if version == 0 {
             // Fresh database: create the schema and stamp it.
             store.create_schema()?;
+        } else if version == 1 {
+            // v1 -> v2: sessions gained the channel-credit columns.
+            //
+            // `retail_allotment = allotment` is the only honest backfill: at the
+            // moment of upgrade every session's ceiling WAS its retail purchase, and
+            // no session can have had a channel. Defaulting to 0 instead would revoke
+            // access from every live customer on upgrade, which is exactly the kind of
+            // "migration that loses value" the repo's own rules forbid.
+            store.migrate_v1_to_v2()?;
         } else if version != SCHEMA_VERSION {
             return Err(StoreError::UnknownSchema { found: version });
         }
 
         Ok(store)
+    }
+
+    /// v1 -> v2: give existing sessions the channel-credit columns.
+    ///
+    /// Idempotent in effect: the columns are added and existing rows are backfilled,
+    /// and re-running is prevented by the `user_version` stamp at the end (a second
+    /// call would fail on the duplicate column, which is why the stamp is written in
+    /// the same transaction).
+    fn migrate_v1_to_v2(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN retail_allotment INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE sessions ADD COLUMN channel_id TEXT;
+             UPDATE sessions SET retail_allotment = allotment;
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+        Ok(())
     }
 
     fn create_schema(&self) -> Result<(), StoreError> {
@@ -137,7 +164,14 @@ impl SessionStore {
                  used       INTEGER NOT NULL,
                  metric     TEXT    NOT NULL,
                  expiry     INTEGER NOT NULL,
-                 granted_at INTEGER NOT NULL
+                 granted_at INTEGER NOT NULL,
+                 -- Effective ceiling vs token-purchased credit. Two columns because
+                 -- the access path recomputes `allotment` from `retail_allotment`
+                 -- plus whatever a bound channel has verifiably paid for; collapsing
+                 -- them would lose the number the customer actually bought.
+                 -- `channel_id` NULL is the retail path and the common case.
+                 retail_allotment INTEGER NOT NULL DEFAULT 0,
+                 channel_id       TEXT
              );
              CREATE TABLE IF NOT EXISTS closed_usage (
                  mac        TEXT PRIMARY KEY,
@@ -167,14 +201,17 @@ impl SessionStore {
     /// Insert or replace a session row.
     pub fn upsert_session(&self, s: &CustomerSession) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO sessions (mac, allotment, used, metric, expiry, granted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO sessions
+                 (mac, allotment, used, metric, expiry, granted_at, retail_allotment, channel_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(mac) DO UPDATE SET
-                 allotment = excluded.allotment,
-                 used      = excluded.used,
-                 metric    = excluded.metric,
-                 expiry    = excluded.expiry,
-                 granted_at= excluded.granted_at",
+                 allotment       = excluded.allotment,
+                 used            = excluded.used,
+                 metric          = excluded.metric,
+                 expiry          = excluded.expiry,
+                 granted_at      = excluded.granted_at,
+                 retail_allotment= excluded.retail_allotment,
+                 channel_id      = excluded.channel_id",
             params![
                 s.mac,
                 s.allotment as i64,
@@ -182,6 +219,8 @@ impl SessionStore {
                 s.metric,
                 s.expiry as i64,
                 s.granted_at as i64,
+                s.retail_allotment as i64,
+                s.channel_id,
             ],
         )?;
         Ok(())
@@ -206,7 +245,10 @@ impl SessionStore {
     pub fn load_sessions(&self) -> Result<Vec<CustomerSession>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT mac, allotment, used, metric, expiry, granted_at FROM sessions")?;
+            .prepare(
+                "SELECT mac, allotment, used, metric, expiry, granted_at, \
+                 retail_allotment, channel_id FROM sessions",
+            )?;
         let rows = stmt.query_map([], |r| {
             Ok(CustomerSession {
                 mac: r.get(0)?,
@@ -215,6 +257,8 @@ impl SessionStore {
                 metric: r.get(3)?,
                 expiry: r.get::<_, i64>(4)? as u64,
                 granted_at: r.get::<_, i64>(5)? as u64,
+                retail_allotment: r.get::<_, i64>(6)? as u64,
+                channel_id: r.get(7)?,
             })
         })?;
         let mut out = Vec::new();

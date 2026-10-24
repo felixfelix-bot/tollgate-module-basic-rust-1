@@ -36,6 +36,8 @@ pub fn terminal_sessions(
 
 pub use store::{SessionStore, StoreError, StoredQuote};
 
+pub mod channel_credit;
+
 /// A single customer session keyed by MAC address.
 #[derive(Debug, Clone)]
 pub struct CustomerSession {
@@ -51,6 +53,17 @@ pub struct CustomerSession {
     pub expiry: u64,
     /// Unix timestamp when the session was granted.
     pub granted_at: u64,
+    /// Allotment bought with tokens.
+    ///
+    /// Kept separate from `allotment` because `allotment` is the EFFECTIVE ceiling:
+    /// it is this number plus whatever a bound Spilman channel has verifiably paid
+    /// for. With no channel bound the two are equal, which is what makes the
+    /// rail-off path bit-identical to the old behaviour rather than merely similar.
+    pub retail_allotment: u64,
+    /// The Spilman channel this session draws credit from, if any.
+    ///
+    /// `None` is the retail path and is the overwhelmingly common case.
+    pub channel_id: Option<String>,
 }
 
 /// Session manager. `store == None` means in-memory (tests / throwaway);
@@ -163,6 +176,9 @@ impl SessionManager {
             metric: metric.to_string(),
             expiry: now + duration_secs,
             granted_at: now,
+            // No channel by default: a token purchase is the retail path.
+            retail_allotment: allotment,
+            channel_id: None,
         };
         self.sessions.insert(mac.to_string(), session.clone());
         self.pending.insert(

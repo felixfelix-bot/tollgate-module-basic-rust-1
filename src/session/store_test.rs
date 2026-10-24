@@ -38,6 +38,8 @@ fn sess(mac: &str, allotment: u64, used: u64, expiry: u64) -> CustomerSession {
         metric: "bytes".to_string(),
         expiry,
         granted_at: now(),
+        retail_allotment: now(),
+        channel_id: None,
     }
 }
 

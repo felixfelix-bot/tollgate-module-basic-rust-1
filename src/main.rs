@@ -263,12 +263,24 @@ async fn main() {
 
             // STEP 3: write the live counters back, THEN decide terminal. Only now
             // can `used >= allotment` be true from real traffic.
+            //
+            // The decision goes through `sweep_with_channel_credit`: for a
+            // channel-bound session it first recomputes `allotment` from the
+            // channel's latest VERIFIED balance, so an increment that landed since
+            // the last tick extends access without a new gate-open, and an exhausted
+            // channel stops granting. With no rail the recomputation is the identity
+            // (`channel_id` is always None, effective == retail), which is what keeps
+            // the rail-off path bit-identical rather than merely similar.
             let terminal = {
                 let mut sessions = sweep_state.sessions.lock().await;
                 for (mac, used) in &live_readings {
                     sessions.update_usage(mac, *used);
                 }
-                let terminal = session::terminal_sessions(sessions.map_ref(), now);
+                let terminal = session::channel_credit::sweep_with_channel_credit(
+                    &mut sessions,
+                    sweep_state.spilman.as_deref(),
+                    now,
+                );
                 for mac in &terminal {
                     // Flush the exact final usage BEFORE removing the row: the
                     // terminal value is what a dispute would be settled against
