@@ -241,8 +241,19 @@ async fn seller_close_exact_settlement_and_restart() {
         .prepare_close(id, 3, &accepted.signature, &f.keyset_info_json)
         .unwrap();
     assert!(f.rail.record_payment(id, 4, &f.sign(4)).await.is_err());
+    // Reopen before any mint spend: only the durable preparation may drive close.
+    let before = SpilmanRail::open(&f._dir.path().join("spilman.db"), 1, Some(MINT_URL.into()))
+        .unwrap()
+        .with_receiver_key(f.receiver_secret.clone());
+    let prepared = before.close_status(id).unwrap();
+    assert_eq!(prepared.state, "prepared");
+    assert_eq!(prepared.receiver_sum, None);
+    println!("SETTLEMENT_BEFORE channel={id} balance=3 state={} receiver_sum={:?}",
+        prepared.state, prepared.receiver_sum);
     let network = InMemoryMintNetworking::new(f._helper.mint());
-    let result = f.rail.execute_close_with_network(id, &network).unwrap();
+    let result = before.execute_close_with_network(id, &network).unwrap();
+    println!("SETTLEMENT_AFTER channel={id} balance=3 state={} receiver_sum={:?}",
+        result.state, result.receiver_sum);
     assert_eq!(result.state, "closed");
     assert_eq!(result.receiver_sum, Some(3));
     let restarted = SpilmanRail::open(&f._dir.path().join("spilman.db"), 1, Some(MINT_URL.into()))
