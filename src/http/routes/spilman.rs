@@ -50,10 +50,14 @@ pub struct ParamsResponse {
 
 pub async fn handle_params(State(state): State<AppState>) -> impl IntoResponse {
     match rail(&state) {
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response(),
         Some(r) => Json(ParamsResponse {
             status: 1,
             mint_url: r.mint_url().map(str::to_string),
@@ -83,24 +87,35 @@ pub async fn handle_payment(
     Json(req): Json<PaymentRequest>,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // The rail decides. A refusal is a 409, not a 500: the request was well-formed
     // and the answer is "no", which is a different fact from "we broke".
-    match r.record_payment(&req.channel_id, req.balance, &req.signature).await {
+    match r
+        .record_payment(&req.channel_id, req.balance, &req.signature)
+        .await
+    {
         Ok(outcome) => Json(PaymentResponse {
             status: 1,
             outcome: format!("{outcome:?}"),
         })
         .into_response(),
-        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({
-            "status": 0,
-            "error": e.to_string()
-        }))).into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -159,10 +174,14 @@ pub async fn handle_register_channel(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // The only parse in this handler. A body that is not a registration is a
@@ -170,10 +189,14 @@ pub async fn handle_register_channel(
     let req: crate::spilman::ChannelRegistrationRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "status": 0,
-                "error": format!("malformed registration body: {e}")
-            }))).into_response()
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": format!("malformed registration body: {e}")
+                })),
+            )
+                .into_response()
         }
     };
 
@@ -194,29 +217,37 @@ pub async fn handle_register_channel(
         .into_response(),
         // 409 for "this id exists with different funding data": the request was
         // well-formed and the answer is "no". Never a silent overwrite.
-        Err(e @ SpilmanError::ChannelAlreadyRegistered { .. }) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({
+        Err(e @ SpilmanError::ChannelAlreadyRegistered { .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
                 "status": 0,
                 "error": e.to_string()
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
         // 400 for a body that cannot become a usable record. Malformed JSON is
         // rejected by axum's extractor before the handler runs (also 400).
-        Err(e @ SpilmanError::InvalidRegistration { .. }) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+        Err(e @ SpilmanError::InvalidRegistration { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
                 "status": 0,
                 "error": e.to_string()
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
         // A store failure is ours, not the caller's, and it must not read as a
         // successful registration: 500 with the reason.
         Err(e) => {
             tracing::error!(channel_id = %req.channel_id, error = %e,
                 "spilman channel registration failed to persist");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": 0,
-                "error": e.to_string()
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": e.to_string()
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -241,10 +272,14 @@ pub async fn handle_status(
     axum::extract::Query(q): axum::extract::Query<StatusQuery>,
 ) -> impl IntoResponse {
     let Some(r) = rail(&state) else {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "spilman rail is not enabled"
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "spilman rail is not enabled"
+            })),
+        )
+            .into_response();
     };
 
     // "Is this channel known?" is a question about the **funding record**, not the
@@ -261,19 +296,25 @@ pub async fn handle_status(
             // tell a payer its funded channel does not exist.
             tracing::error!(channel_id = %q.channel_id, error = %e,
                 "spilman funding read failed; refusing to answer /status");
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "status": 0,
-                "error": "channel ledger unreadable"
-            })))
-            .into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": 0,
+                    "error": "channel ledger unreadable"
+                })),
+            )
+                .into_response();
         }
     };
     if !known {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": 0,
-            "error": "unknown channel"
-        })))
-        .into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": 0,
+                "error": "unknown channel"
+            })),
+        )
+            .into_response();
     }
 
     // Known: report the credit decision and the balance it is derived from.
@@ -290,6 +331,92 @@ pub async fn handle_status(
     .into_response()
 }
 
+/// POST /spilman/close — only a durably completed close returns a receipt.
+pub async fn handle_close(
+    State(state): State<AppState>,
+    Json(payment): Json<cdk_spilman::Payment>,
+) -> axum::response::Response {
+    let Some(r) = rail(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let refuse = |status, message: &str| {
+        (status, Json(serde_json::json!({"error": message}))).into_response()
+    };
+    match r.authenticated_close_receipt(&payment) {
+        Ok(Some(receipt)) => return Json(receipt).into_response(),
+        Ok(None) => {}
+        Err(_) => return refuse(StatusCode::CONFLICT, "close authorization refused"),
+    }
+    // Recovery uses the journal's exact outputs; never discover new keys for it.
+    if r.close_status(&payment.channel_id).is_err() {
+        use cdk_spilman::configurable_networking::{
+            build_keyset_info_json, fetch_all_keysets_from_mint,
+        };
+        let Some(mint) = r.mint_url() else {
+            return refuse(StatusCode::CONFLICT, "mint not configured");
+        };
+        let discovery = match fetch_all_keysets_from_mint(mint).await {
+            Ok(v) => v,
+            Err(_) => return refuse(StatusCode::BAD_GATEWAY, "mint keyset discovery failed"),
+        };
+        let now = crate::spilman::payer::now_seconds();
+        let Some(keys) = discovery.keysets.iter().find(|k| {
+            k.active
+                && k.unit == cashu::nuts::CurrencyUnit::Sat
+                && k.final_expiry.map_or(true, |expiry| expiry > now)
+        }) else {
+            return refuse(StatusCode::BAD_GATEWAY, "no usable mint keyset");
+        };
+        let info = build_keyset_info_json(
+            &keys.id,
+            &keys.unit,
+            &keys.keys,
+            keys.input_fee_ppk,
+            keys.final_expiry,
+        );
+        if r.prepare_close(
+            &payment.channel_id,
+            payment.balance,
+            &payment.signature,
+            &info,
+        )
+        .is_err()
+        {
+            return refuse(StatusCode::CONFLICT, "close preparation refused");
+        }
+    }
+    // The upstream synchronous adapter bridges into Tokio. Keep SQLite and
+    // blocking network work off the HTTP task, including on current-thread tests.
+    let execution_rail = r.clone();
+    let id = payment.channel_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let network = cdk_spilman::configurable_networking::ReqwestClientNetworking::new(
+            std::time::Duration::from_secs(15),
+        )
+        .map_err(|e| e.to_string())?;
+        execution_rail
+            .execute_close_with_network(&id, &network)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(_))) {
+        return refuse(
+            StatusCode::BAD_GATEWAY,
+            "close incomplete; retry the same authorized payment",
+        );
+    }
+    match r.authenticated_close_receipt(&payment) {
+        Ok(Some(mut receipt)) => {
+            receipt.already_closed = false;
+            Json(receipt).into_response()
+        }
+        _ => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "durable close receipt unavailable",
+        ),
+    }
+}
+
 /// Build the `/spilman` sub-router.
 ///
 /// Mounted by `create_router` **only when the rail exists**, so a disabled rail
@@ -299,5 +426,6 @@ pub fn spilman_router() -> axum::Router<AppState> {
         .route("/params", axum::routing::get(handle_params))
         .route("/channel", axum::routing::post(handle_register_channel))
         .route("/payment", axum::routing::post(handle_payment))
+        .route("/close", axum::routing::post(handle_close))
         .route("/status", axum::routing::get(handle_status))
 }

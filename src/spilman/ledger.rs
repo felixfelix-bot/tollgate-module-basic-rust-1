@@ -183,7 +183,8 @@ impl ChannelLedger {
                  keyset_info_json    TEXT    NOT NULL,
                  capacity            INTEGER NOT NULL,
                  created_at          INTEGER NOT NULL
-             ) STRICT;",
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS spilman_close (channel_id TEXT PRIMARY KEY, prepared TEXT NOT NULL, state TEXT NOT NULL, completed TEXT) STRICT;",
         )
         .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
         Ok(())
@@ -255,6 +256,17 @@ impl ChannelLedger {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
 
+        let closing: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM spilman_close WHERE channel_id=?1)",
+                [channel_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        if closing {
+            return Err(SpilmanError::Ledger("channel is closing or closed".into()));
+        }
+
         let previous: Option<(u64, u64)> = tx
             .query_row(
                 "SELECT balance, payment_count FROM spilman_channel_balance WHERE channel_id = ?1",
@@ -321,6 +333,58 @@ impl ChannelLedger {
         tx.commit()
             .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
         Ok(LedgerOutcome::Accepted)
+    }
+
+    /// Freeze the exact accepted authorization and immutable preparation atomically.
+    pub(crate) fn freeze_close(
+        &self,
+        id: &str,
+        balance: u64,
+        signature: &str,
+        prepared: &str,
+    ) -> Result<(), SpilmanError> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM spilman_channel_balance b JOIN spilman_channel_funding f USING(channel_id) WHERE channel_id=?1 AND b.balance=?2 AND b.signature=?3)", rusqlite::params![id,balance,signature], |r|r.get(0)).map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        if !matches {
+            return Err(SpilmanError::Ledger(
+                "close authorization is not the latest accepted payment".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO spilman_close(channel_id,prepared,state) VALUES(?1,?2,'prepared')",
+            rusqlite::params![id, prepared],
+        )
+        .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
+        tx.commit().map_err(|e| SpilmanError::Ledger(e.to_string()))
+    }
+
+    pub(crate) fn close_journal(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, SpilmanError> {
+        self.lock()?
+            .query_row(
+                "SELECT prepared,state,completed FROM spilman_close WHERE channel_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| SpilmanError::Ledger(e.to_string()))
+    }
+
+    /// Claim execution before network I/O. A lost response leaves uncertain, never prepared.
+    pub(crate) fn advance_close(
+        &self,
+        id: &str,
+        prepared: &str,
+        from: &str,
+        to: &str,
+        completed: Option<&str>,
+    ) -> Result<bool, SpilmanError> {
+        Ok(self.lock()?.execute("UPDATE spilman_close SET state=?4,completed=?5 WHERE channel_id=?1 AND prepared=?2 AND state=?3", rusqlite::params![id,prepared,from,to,completed]).map_err(|e|SpilmanError::Ledger(e.to_string()))? == 1)
     }
 
     /// Number of accepted payments for a channel (0 when unknown).
@@ -449,8 +513,13 @@ impl ChannelLedger {
             .optional()
             .map_err(|e| SpilmanError::Ledger(e.to_string()))?;
 
-        if let Some((params_json, funding_proofs_json, channel_secret_hex, keyset_info_json, capacity)) =
-            existing
+        if let Some((
+            params_json,
+            funding_proofs_json,
+            channel_secret_hex,
+            keyset_info_json,
+            capacity,
+        )) = existing
         {
             // `created_at` is deliberately NOT compared: it is the payee's own clock,
             // not the payer's data, so including it would turn every honest retry into

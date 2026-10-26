@@ -222,6 +222,81 @@ where
         .map_err(SpilmanError::Bridge)
 }
 
+/// A signed close request bound to the expected seller receipt.
+#[derive(Debug)]
+pub struct CooperativeSettlement {
+    payment: Payment,
+}
+
+/// Wire representation of upstream `CloseSuccess` (upstream only derives Serialize).
+#[derive(Debug, serde::Deserialize)]
+pub struct SettlementReceipt {
+    pub channel_id: String,
+    pub total_value: u64,
+    pub receiver_sum: u64,
+    pub sender_sum: u64,
+    pub sender_proofs: String,
+    pub already_closed: bool,
+}
+
+impl CooperativeSettlement {
+    pub fn prepare<H: SpilmanClientHost, N: SpilmanClientNetworking>(
+        bridge: &SpilmanClientBridge<H, N>,
+        channel_id: &str,
+        final_balance: u64,
+    ) -> Result<Self, SpilmanError> {
+        bridge
+            .sign_cooperative_close_request(channel_id, final_balance)
+            .map(|payment| Self { payment })
+            .map_err(SpilmanError::Bridge)
+    }
+
+    /// Reuse the exact accepted authorization: Schnorr signatures are randomized.
+    /// Re-sign first to enforce local ownership, but send the persisted payment.
+    pub fn from_accepted_payment<H: SpilmanClientHost, N: SpilmanClientNetworking>(
+        bridge: &SpilmanClientBridge<H, N>,
+        payment: &Payment,
+    ) -> Result<Self, SpilmanError> {
+        let mut settlement = Self::prepare(bridge, &payment.channel_id, payment.balance)?;
+        settlement.payment.signature = payment.signature.clone();
+        Ok(settlement)
+    }
+
+    pub fn payment(&self) -> &Payment {
+        &self.payment
+    }
+
+    /// Accept only a complete, matching successful seller close receipt, then mark
+    /// the payer closed. The seller is responsible for mint execution; this is
+    /// structural/accounting validation, not independent mint attestation.
+    pub fn complete<H: SpilmanClientHost, N: SpilmanClientNetworking>(
+        &self,
+        bridge: &SpilmanClientBridge<H, N>,
+        response_json: &str,
+    ) -> Result<SettlementReceipt, SpilmanError> {
+        let receipt: SettlementReceipt = serde_json::from_str(response_json)
+            .map_err(|e| SpilmanError::Bridge(format!("invalid close receipt: {e}")))?;
+        let proofs: Vec<cashu::nuts::Proof> = serde_json::from_str(&receipt.sender_proofs)
+            .map_err(|e| SpilmanError::Bridge(format!("invalid sender proofs: {e}")))?;
+        let sender_sum = proofs
+            .iter()
+            .try_fold(0u64, |sum, proof| sum.checked_add(proof.amount.to_u64()));
+        if receipt.channel_id != self.payment.channel_id
+            || receipt.receiver_sum != self.payment.balance
+            || receipt.receiver_sum.checked_add(receipt.sender_sum) != Some(receipt.total_value)
+            || sender_sum != Some(receipt.sender_sum)
+        {
+            return Err(SpilmanError::Bridge(
+                "close receipt does not match signed settlement".into(),
+            ));
+        }
+        bridge
+            .process_cooperative_close_response(response_json)
+            .map_err(SpilmanError::Bridge)?;
+        Ok(receipt)
+    }
+}
+
 /// Open a second, independent connection to a payer store.
 ///
 /// cdk-spilman implements `SpilmanClientHost` on the concrete

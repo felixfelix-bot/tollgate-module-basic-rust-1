@@ -59,6 +59,7 @@ pub struct SpilmanRail {
     ledger: ChannelLedger,
     pricing: SessionPricing,
     mint_url: Option<String>,
+    receiver_key: Option<cashu::nuts::SecretKey>,
 }
 
 impl SpilmanRail {
@@ -99,6 +100,7 @@ impl SpilmanRail {
             ledger: ChannelLedger::open(path)?,
             pricing,
             mint_url,
+            receiver_key: None,
         })
     }
 
@@ -215,6 +217,220 @@ impl SpilmanRail {
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
         self.ledger.record_payment(channel_id, balance, signature)
+    }
+}
+
+/// Public close status. Never includes the secret-bearing preparation or payout proofs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SellerCloseStatus {
+    pub channel_id: String,
+    pub state: String,
+    pub receiver_sum: Option<u64>,
+}
+
+fn close_error(e: impl std::fmt::Debug) -> SpilmanError {
+    SpilmanError::Ledger(format!("{e:?}"))
+}
+
+impl SpilmanRail {
+    pub fn with_receiver_key(mut self, key: cashu::nuts::SecretKey) -> Self {
+        self.receiver_key = Some(key);
+        self
+    }
+
+    /// Authenticate before any mint I/O; return only the sender's durable receipt.
+    /// `None` means authorized, but completion has not yet been persisted.
+    pub fn authenticated_close_receipt(
+        &self, payment: &cdk_spilman::Payment,
+    ) -> Result<Option<cdk_spilman::CloseSuccess>, SpilmanError> {
+        let id = &payment.channel_id;
+        let funding = self.ledger.get_channel_funding(id)?
+            .ok_or_else(|| close_error("unknown channel"))?;
+        let params: serde_json::Value = serde_json::from_str(&funding.params_json).map_err(close_error)?;
+        if params["mint"].as_str() != self.mint_url.as_deref() {
+            return Err(close_error("channel mint does not match configured mint"));
+        }
+        let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
+            .map_err(close_error)?.try_into().map_err(close_error)?;
+        let parameters = cdk_spilman::ChannelParameters::from_json_with_channel_secret(
+            &funding.params_json,
+            cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json).map_err(close_error)?,
+            secret).map_err(close_error)?;
+        let channel = cdk_spilman::EstablishedChannel::new(parameters,
+            serde_json::from_str(&funding.funding_proofs_json).map_err(close_error)?)
+            .map_err(close_error)?;
+        cdk_spilman::BalanceUpdateMessage {
+            channel_id: id.clone(), amount: payment.balance,
+            signature: payment.signature.parse().map_err(close_error)?,
+        }.verify_sender_signature(&channel).map_err(close_error)?;
+        let latest = self.ledger.get_latest_payment(id)?
+            .ok_or_else(|| close_error("missing accepted payment"))?;
+        if latest.balance != payment.balance || latest.signature != payment.signature {
+            return Err(close_error("close authorization does not match accepted payment"));
+        }
+        let Some((_, state, completed)) = self.ledger.close_journal(id)? else { return Ok(None); };
+        if state != "closed" { return Ok(None); }
+        let completed: cdk_spilman::CompletedClose = serde_json::from_str(
+            &completed.ok_or_else(|| close_error("closed journal missing completion"))?
+        ).map_err(close_error)?;
+        if completed.channel_id != *id || completed.balance != payment.balance {
+            return Err(close_error("completion binding mismatch"));
+        }
+        Ok(Some(cdk_spilman::CloseSuccess {
+            channel_id: id.clone(),
+            total_value: completed.receiver_sum.checked_add(completed.sender_sum)
+                .ok_or_else(|| close_error("completion value overflow"))?,
+            receiver_sum: completed.receiver_sum,
+            sender_sum: completed.sender_sum,
+            sender_proofs: completed.sender_proofs_json,
+            already_closed: true,
+        }))
+    }
+
+    pub fn close_status(&self, id: &str) -> Result<SellerCloseStatus, SpilmanError> {
+        let (_, state, completed) = self
+            .ledger
+            .close_journal(id)?
+            .ok_or_else(|| close_error("no close journal"))?;
+        let completed: Option<cdk_spilman::CompletedClose> = completed
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(close_error)?;
+        Ok(SellerCloseStatus {
+            channel_id: id.into(),
+            state,
+            receiver_sum: completed.map(|c| c.receiver_sum),
+        })
+    }
+
+    /// The output keyset must be fetched from the configured mint by the caller, not supplied by a remote payer.
+    pub fn prepare_close(
+        &self,
+        id: &str,
+        balance: u64,
+        signature: &str,
+        output_keyset_json: &str,
+    ) -> Result<SellerCloseStatus, SpilmanError> {
+        let key = self
+            .receiver_key
+            .as_ref()
+            .ok_or_else(|| close_error("receiver signing key unavailable"))?;
+        let funding = self
+            .ledger
+            .get_channel_funding(id)?
+            .ok_or_else(|| close_error("unknown channel"))?;
+        let params: serde_json::Value =
+            serde_json::from_str(&funding.params_json).map_err(close_error)?;
+        let mint = params["mint"]
+            .as_str()
+            .ok_or_else(|| close_error("missing mint"))?;
+        if self.mint_url.as_deref() != Some(mint) {
+            return Err(close_error("channel mint does not match configured mint"));
+        }
+        if let Some((saved, _, _)) = self.ledger.close_journal(id)? {
+            let saved: cdk_spilman::PreparedCloseTransition =
+                serde_json::from_str(&saved).map_err(close_error)?;
+            if saved.payment.balance != balance || saved.payment.signature != signature {
+                return Err(close_error("close authorization mismatch"));
+            }
+            return self.close_status(id);
+        }
+        let bridge = SpilmanBridge::new(LedgerPayeeHost::for_close(
+            &self.ledger,
+            key,
+            mint,
+            output_keyset_json,
+        ));
+        let transition = bridge
+            .prepare_cooperative_close_transition(
+                &serde_json::json!({"channel_id":id,"balance":balance,"signature":signature})
+                    .to_string(),
+            )
+            .map_err(close_error)?;
+        let stored = serde_json::to_string(&transition).map_err(close_error)?;
+        self.ledger.freeze_close(id, balance, signature, &stored)?;
+        self.close_status(id)
+    }
+
+    /// Execute at most once. An uncertain operation is recovered only by exact NUT-09 restore.
+    /// Empty restore is NOT permission to replay: retain uncertainty for operator recovery.
+    pub fn execute_close_with_network<N: cdk_spilman::SpilmanClientNetworking>(
+        &self,
+        id: &str,
+        network: &N,
+    ) -> Result<SellerCloseStatus, SpilmanError> {
+        use cdk_spilman::SpilmanHost;
+        let (saved, state, _) = self
+            .ledger
+            .close_journal(id)?
+            .ok_or_else(|| close_error("no close journal"))?;
+        if state == "closed" {
+            return self.close_status(id);
+        }
+        let transition: cdk_spilman::PreparedCloseTransition =
+            serde_json::from_str(&saved).map_err(close_error)?;
+        let prepared = &transition.prepared_close;
+        let key = self
+            .receiver_key
+            .as_ref()
+            .ok_or_else(|| close_error("receiver signing key unavailable"))?;
+        let keyset_json = prepared.output_keyset_info.to_string();
+        let host = LedgerPayeeHost::for_close(&self.ledger, key, &prepared.mint_url, &keyset_json);
+        let funding = host
+            .get_funding(id)
+            .ok_or_else(|| close_error("missing funding"))?;
+        let latest = self
+            .ledger
+            .get_latest_payment(id)?
+            .ok_or_else(|| close_error("missing payment"))?;
+        if latest.balance != transition.payment.balance
+            || latest.signature != transition.payment.signature
+            || prepared.channel_id != id
+            || self.mint_url.as_deref() != Some(&prepared.mint_url)
+        {
+            return Err(close_error("journal binding mismatch"));
+        }
+        let bridge = SpilmanBridge::new(host);
+        bridge
+            .verify_prepared_close(prepared, &funding, &transition.payment, &key.public_key())
+            .map_err(close_error)?;
+        let claimed = self
+            .ledger
+            .advance_close(id, &saved, "prepared", "uncertain", None)?;
+        let completed = if claimed {
+            let response = network
+                .call_mint_swap(&prepared.mint_url, &prepared.swap_request.to_string())
+                .map_err(close_error)?;
+            bridge
+                .complete_prepared_close(&response, prepared)
+                .map_err(close_error)?
+        } else {
+            let response = network
+                .call_mint_restore(
+                    &prepared.mint_url,
+                    &serde_json::json!({"outputs":prepared.swap_request["outputs"]}).to_string(),
+                )
+                .map_err(close_error)?;
+            bridge
+                .complete_prepared_close_restore(&response, prepared)
+                .map_err(close_error)?
+                .ok_or_else(|| {
+                    close_error(
+                        "close remains uncertain: no exact restore; swap will not be repeated",
+                    )
+                })?
+        };
+        let json = serde_json::to_string(&completed).map_err(close_error)?;
+        if !self
+            .ledger
+            .advance_close(id, &saved, "uncertain", "closed", Some(&json))?
+        {
+            let status = self.close_status(id)?;
+            if status.state != "closed" {
+                return Err(close_error("close completion CAS refused"));
+            }
+        }
+        self.close_status(id)
     }
 }
 

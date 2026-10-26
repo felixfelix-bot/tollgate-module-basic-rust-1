@@ -116,7 +116,12 @@ async fn main() {
     // into the wholesale rail and got the config wrong must not silently fall back
     // to "channel payments are refused" or, worse, to a ledger that forgets.
     let spilman_rail = match spilman::SpilmanRail::from_config(&config_obj.spilman) {
-        Ok(rail) => rail.map(Arc::new),
+        Ok(rail) => rail.map(|rail| {
+            let receiver_key =
+                cashu::nuts::SecretKey::from_slice(&identity.secret_key.secret_bytes())
+                    .expect("merchant identity is a valid secp256k1 scalar");
+            Arc::new(rail.with_receiver_key(receiver_key))
+        }),
         Err(e) => {
             eprintln!("FATAL: spilman config: {e}");
             std::process::exit(78); // EX_CONFIG

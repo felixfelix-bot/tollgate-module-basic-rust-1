@@ -58,12 +58,31 @@ use crate::spilman::ledger::{ChannelFundingRecord, ChannelLedger};
 #[derive(Debug)]
 pub struct LedgerPayeeHost<'a> {
     ledger: &'a ChannelLedger,
+    receiver: Option<&'a cashu::nuts::SecretKey>,
+    close_keyset: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> LedgerPayeeHost<'a> {
+    pub fn for_close(
+        ledger: &'a ChannelLedger,
+        receiver: &'a cashu::nuts::SecretKey,
+        mint: &'a str,
+        keyset: &'a str,
+    ) -> Self {
+        Self {
+            ledger,
+            receiver: Some(receiver),
+            close_keyset: Some((mint, keyset)),
+        }
+    }
+
     /// Wrap a ledger as a cdk-spilman payee host.
     pub fn new(ledger: &'a ChannelLedger) -> Self {
-        Self { ledger }
+        Self {
+            ledger,
+            receiver: None,
+            close_keyset: None,
+        }
     }
 }
 
@@ -192,7 +211,7 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
     /// is never recorded, i.e. the payee serves nothing.
     fn record_payment(&self, _channel_id: &str, _payment: PaymentProof, _context: &String) {}
 
-    /// `Open` for a channel that has a funding record, `None` otherwise.
+    /// Durable lifecycle state for a funded channel, `None` otherwise.
     ///
     /// This is the gate `validate_payment` passes first (`validate_payment_request`,
     /// bridge.rs:1451): anything other than `Some(Open)` is `UnknownChannel`. So the
@@ -200,7 +219,15 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
     /// a balance row, which is exactly the state a forgery creates.
     fn get_channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
         match self.ledger.get_channel_funding(channel_id) {
-            Ok(Some(_)) => Ok(Some(ChannelState::Open)),
+            Ok(Some(_)) => match self
+                .ledger
+                .close_journal(channel_id)
+                .map_err(|e| e.to_string())?
+            {
+                Some((_, state, _)) if state == "closed" => Ok(Some(ChannelState::Closed)),
+                Some(_) => Ok(Some(ChannelState::Closing)),
+                None => Ok(Some(ChannelState::Open)),
+            },
             Ok(None) => Ok(None),
             // A read failure must be an error, never `None`-as-"not open" and never
             // `Open`: upstream propagates it and refuses.
@@ -257,11 +284,16 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
         }
     }
 
-    /// NOT ON THE VERIFICATION PATH — this host holds no keyset cache. An empty
-    /// list cannot select an output keyset, so upstream refuses rather than
-    /// building a swap against a keyset nobody checked.
-    fn get_active_keyset_ids(&self, _mint: &str, _unit: &CurrencyUnit) -> Vec<Id> {
-        Vec::new()
+    /// Close preparation uses the mint-fetched keyset explicitly supplied by the caller.
+    fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id> {
+        self.close_keyset
+            .and_then(|(m, json)| {
+                cdk_spilman::parse_keyset_info_from_json(json)
+                    .ok()
+                    .filter(|k| m == mint && &k.unit == unit)
+            })
+            .map(|k| vec![k.keyset_id])
+            .unwrap_or_default()
     }
 
     /// NOT ON THE VERIFICATION PATH — no keyset cache, so `false`.
@@ -274,8 +306,10 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
     /// Note the verification path does *not* come through here: it reads
     /// `keyset_info_json` straight off the funding record, which is the copy the
     /// signature was actually verified against when the channel was opened.
-    fn get_keyset_info(&self, _mint: &str, _keyset_id: &Id) -> Option<String> {
-        None
+    fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String> {
+        let (m, json) = self.close_keyset?;
+        let info = cdk_spilman::parse_keyset_info_from_json(json).ok()?;
+        (m == mint && &info.keyset_id == keyset_id).then(|| json.to_string())
     }
 
     /// NOT ON THE VERIFICATION PATH — see `mark_channel_closing`.
@@ -312,16 +346,21 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
         ))
     }
 
-    /// NOT ON THE VERIFICATION PATH — only the close path signs with the tweaked
-    /// receiver key, and this host has no receiver key.
+    /// Sign using upstream parity/tweak handling and only the explicitly installed receiver key.
     fn sign_with_tweaked_key(
         &self,
         signer_pubkey_hex: &str,
-        _message_hex: &str,
-        _tweak_scalar_hex: &str,
+        message_hex: &str,
+        tweak_scalar_hex: &str,
     ) -> Result<String, String> {
-        Err(format!(
-            "this payee holds no signing key for {signer_pubkey_hex}"
-        ))
+        let key = self.receiver.ok_or("receiver signing key unavailable")?;
+        if key.public_key().to_hex() != signer_pubkey_hex {
+            return Err("receiver key mismatch".into());
+        }
+        cdk_spilman::sign_with_tweaked_key_util(
+            &hex::encode(key.secret_bytes()),
+            message_hex,
+            tweak_scalar_hex,
+        )
     }
 }
