@@ -1,56 +1,23 @@
-//! `spilman-payer` — **a TEST DRIVER**, not a product feature.
-//!
-//! It performs the full payer half of the channel protocol against a *running*
-//! payee, so the physical-router E2E can exercise the protocol over HTTP instead of
-//! only in-process:
-//!
-//! ```text
-//! 1. GET  /spilman/params    read the payee's mint + rate
-//! 2. (local)                 open a channel against that mint, fund it
-//! 3. POST /spilman/channel   register the funding record with the payee
-//! 4. POST /spilman/payment   sign a balance update and pay
-//! 5. GET  /spilman/status    read back what the payee credited
-//! ```
-//!
-//! # Why it is an example, not a `[[bin]]`
-//!
-//! It needs the in-process `cdk-spilman-test-mint`, which is a **dev-dependency**.
-//! A `[[bin]]` cannot use dev-dependencies; an example can. Making it a bin would
-//! force the test mint into the dependency graph of every shipped artifact — a
-//! router image carrying a fake mint is exactly the kind of thing that later gets
-//! switched on by accident. It is additionally behind `required-features =
-//! ["payer-driver"]`, so a plain `cargo build` / `cargo test` neither builds nor
-//! installs it.
-//!
-//! # Running it
-//!
-//! ```text
-//! # terminal 1 — the payee, with the rail on
-//! cargo run --release
-//! cargo run --example spilman-payer --features payer-driver -- --payee http://127.0.0.1:8080
-//! ```
-//!
-//! Every step prints its outcome; the process exits non-zero on the first failure.
-//! That is the whole contract: a driver that printed a trace and exited 0 would
-//! make a red E2E look green.
-//!
-//! # What it deliberately does not do
-//!
-//! No retries, no fallbacks, no partial success. Each step is a precondition for the
-//! next (a channel that did not open cannot be registered; a payment the payee
-//! refused must not be followed by a "settled" line), so continuing past a failure
-//! would produce a log that reads like a run and isn't one.
+//! External-mint physical-router test driver. Uses the seller-advertised mint
+//! via NUT-04 HTTP quote/mint and real blinded proofs, then funds a Spilman channel.
+//! Test mint FakeWallet auto-pays quotes; other mints need the printed invoice paid.
+//! No local mint, fabricated proofs, or URL substitution. Never use real funds:
+//! payer state is temporary and the seller close lifecycle is not implemented.
+//! With --phase-dir DIR, pre-create DIR but NOT funded.continue / paid.continue.
+//! Wait for PAYER_PHASE_READY phase=funded, start measurement, create funded.continue.
+//! Wait for phase=paid, stop measurement, create paid.continue. Gates time out at 300s.
+//! PAYER_PAYMENT_OK proves seller credit, NOT mint settlement.
 
+use cashu::nuts::SecretKey;
 use cdk_spilman::{
     build_cashu_b_token, parse_keyset_info_from_json, ConfigurableClientHost, SpilmanClientBridge,
 };
-use cdk_spilman_test_mint::{serve_existing_mint_with_shutdown, TestMintConfig, TestMintHelper};
-use cashu::nuts::SecretKey;
+use std::io::Write;
 use tollgate_module_basic_rust::spilman::payer::{
     self, ChannelOpening, DEFAULT_CHANNEL_LIFETIME_SECS,
 };
-use tollgate_module_basic_rust::spilman::registration::ChannelRegistrationRequest;
 use tollgate_module_basic_rust::spilman::payer_driver::PayeeClient;
+use tollgate_module_basic_rust::spilman::registration::ChannelRegistrationRequest;
 use tollgate_module_basic_rust::spilman::SpilmanError;
 
 /// Capacity, in sats, of the channel this driver opens.
@@ -65,7 +32,6 @@ const PAYMENT_RAW_UNITS: u64 = 1;
 /// One request's timeout against the payee — see `PayableClient`'s own default.
 const EXAMPLE_PAYEE_URL: &str = "http://127.0.0.1:8080";
 
-
 /// Print a step's outcome in a shape a log can be grepped for.
 fn step(n: u8, what: &str, outcome: &str) {
     println!("[{n}/5] {what}: {outcome}");
@@ -75,7 +41,7 @@ fn step(n: u8, what: &str, outcome: &str) {
 ///
 /// The human `step()` lines above are for a person reading a log; these are the
 /// contract the physical-router lane parses
-/// (`spilman/spilman_router_lane.py`, `RE_OPEN_OK` / `RE_SETTLE_OK` / `RE_EXIT`).
+/// (`PAYER_OPEN_OK`, `PAYER_PAYMENT_OK`, and `PAYER_EXIT`).
 /// Both are printed: a marker that replaced the human line would make the lane
 /// pass while making the failure harder for a person to read, and the lane's own
 /// rule is that a driver which exists but does not emit these is a FAIL, not a
@@ -83,10 +49,11 @@ fn step(n: u8, what: &str, outcome: &str) {
 ///
 /// The shapes are fixed by the lane's regexes:
 ///   PAYER_OPEN_OK channel_id=<hex>
-///   PAYER_SETTLE_OK channel_id=<hex> balance=<n> payee_credited=<n>
+///   PAYER_PAYMENT_OK channel_id=<hex> balance=<n> payee_credited=<n>
 ///   PAYER_EXIT=<n>
 fn marker(line: &str) {
     println!("{line}");
+    std::io::stdout().flush().expect("flush marker");
 }
 
 /// The exit code the driver ends with, mirrored as a marker line.
@@ -121,40 +88,162 @@ fn mint_networking() -> Result<cdk_spilman::ReqwestClientNetworking, SpilmanErro
         .map_err(|e| SpilmanError::Config(format!("build the mint networking client: {e}")))
 }
 
-/// Parse `--payee <url>`; anything else is a usage error.
-fn parse_args() -> String {
+/// Parse seller URL and optional file-based phase gates.
+fn parse_args() -> (String, Option<std::path::PathBuf>) {
     let mut args = std::env::args().skip(1);
     let mut payee: Option<String> = None;
+    let mut phase_dir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--payee" => payee = args.next(),
+            "--external-mint" => {} // explicit alias; external is now the default
+            "--phase-dir" => {
+                phase_dir = Some(std::path::PathBuf::from(
+                    args.next().unwrap_or_else(|| exit_with(2)),
+                ))
+            }
             "--help" | "-h" => {
-                println!("usage: spilman-payer --payee <base-url>");
+                println!(
+                    "usage: spilman-payer --payee <base-url> [--external-mint] [--phase-dir <dir>]"
+                );
                 println!();
-                println!("  --payee <url>   the running module's base URL, e.g. {EXAMPLE_PAYEE_URL}");
+                println!(
+                    "  --payee <url>   the running module's base URL, e.g. {EXAMPLE_PAYEE_URL}"
+                );
                 exit_with(0);
             }
             other => {
                 eprintln!("unexpected argument: {other}");
-                eprintln!("usage: spilman-payer --payee <base-url>");
+                eprintln!(
+                    "usage: spilman-payer --payee <base-url> [--external-mint] [--phase-dir <dir>]"
+                );
                 exit_with(2);
             }
         }
     }
     match payee {
-        Some(url) if !url.trim().is_empty() => url,
+        Some(url) if !url.trim().is_empty() => (url, phase_dir),
         _ => {
-            eprintln!("usage: spilman-payer --payee <base-url>");
+            eprintln!(
+                "usage: spilman-payer --payee <base-url> [--external-mint] [--phase-dir <dir>]"
+            );
             exit_with(2);
         }
     }
+}
+
+async fn phase_gate(dir: Option<&std::path::Path>, phase: &str) {
+    marker(&format!("PAYER_PHASE_READY phase={phase}"));
+    if let Some(dir) = dir {
+        let gate = dir.join(format!("{phase}.continue"));
+        for _ in 0..3000 {
+            if gate.is_file() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        eprintln!("FAILED waiting for {}", gate.display());
+        exit_with(1);
+    }
+}
+
+async fn fund_external(
+    url: &str,
+) -> Result<(String, Vec<cashu::nuts::Proof>), Box<dyn std::error::Error>> {
+    use cashu::amount::SplitTarget;
+    use cashu::nuts::{Id, Keys, MintResponse, PreMintSecrets};
+    use serde_json::{json, Value};
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let sets: Value = http
+        .get(format!("{url}/v1/keysets"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let set = sets["keysets"]
+        .as_array()
+        .ok_or("missing keysets")?
+        .iter()
+        .find(|s| s["active"] == true && s["unit"] == "sat")
+        .ok_or("no active sat keyset")?;
+    let id_text = set["id"].as_str().ok_or("missing keyset id")?;
+    let id: Id = id_text.parse()?;
+    let response: Value = http
+        .get(format!("{url}/v1/keys/{id_text}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let keyset = response["keysets"]
+        .as_array()
+        .ok_or("missing keys")?
+        .iter()
+        .find(|s| s["id"] == id_text)
+        .ok_or("keyset mismatch")?;
+    let keys: Keys = serde_json::from_value(keyset["keys"].clone())?;
+    let info = json!({"keysetId": id_text, "unit":"sat", "keys":keyset["keys"],
+        "inputFeePpk":set["input_fee_ppk"].as_u64().unwrap_or(0)})
+    .to_string();
+    let quote: Value = http
+        .post(format!("{url}/v1/mint/quote/bolt11"))
+        .json(&json!({"amount":CHANNEL_CAPACITY*2,"unit":"sat"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let quote_id = quote["quote"].as_str().ok_or("missing quote")?;
+    println!(
+        "PAYER_FUNDING_INVOICE {}",
+        quote["request"].as_str().ok_or("missing invoice")?
+    );
+    let mut paid = false;
+    for _ in 0..120 {
+        let q: Value = http
+            .get(format!("{url}/v1/mint/quote/bolt11/{quote_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if q["state"] == "PAID" {
+            paid = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    if !paid {
+        return Err("funding invoice not paid within 120s".into());
+    }
+    let fees: (u64, Vec<u64>) = (0, keys.iter().map(|a| a.0.to_u64()).collect());
+    let secrets = PreMintSecrets::random(
+        id,
+        (CHANNEL_CAPACITY * 2).into(),
+        &SplitTarget::None,
+        &fees.into(),
+    )?;
+    let minted: MintResponse = http
+        .post(format!("{url}/v1/mint/bolt11"))
+        .json(&json!({"quote":quote_id,"outputs":secrets.blinded_messages()}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let proofs =
+        cashu::dhke::construct_proofs(minted.signatures, secrets.rs(), secrets.secrets(), &keys)?;
+    Ok((info, proofs))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     // `ReqwestClientNetworking` bridges sync->async with `block_in_place`, so a
     // multi-thread runtime is required; `multi_thread` above is not decoration.
-    let payee_url = parse_args();
+    let (payee_url, phase_dir) = parse_args();
 
     let tempdir = match tempfile::tempdir() {
         Ok(dir) => dir,
@@ -190,100 +279,28 @@ async fn main() {
         ),
     );
 
-    // ── STEP 2: open and fund a real channel against a real mint ────────────
-    //
-    // The mint is in-process (a FakeWallet-backed real `cdk::Mint`), so the driver
-    // needs no external service. It is served over HTTP as well as handed to the
-    // payer's bridge, because the *payee* must be able to name the same mint: a
-    // channel funded at `https://test-mint` is only verifiable if the record the
-    // payee stores says `https://test-mint` too.
-    let helper = match TestMintHelper::new().await {
-        Ok(helper) => helper,
+    // External mode never creates a local mint or substitutes its URL.
+    let mint_url = advertised_mint.trim_end_matches('/').to_string();
+    let (keyset_info_json, proofs) = match fund_external(&mint_url).await {
+        Ok(result) => result,
         Err(e) => {
-            eprintln!("FAILED to start the in-process test mint: {e}");
+            eprintln!("FAILED external funding: {e}");
             exit_with(1);
         }
     };
-    let keyset_info_json = match helper.keyset_info_json() {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("FAILED to read the test mint's keyset info: {e}");
-            exit_with(1);
-        }
-    };
-
-    // Bind an ephemeral port so two drivers can run at once.
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("FAILED to bind the test mint: {e}");
-            exit_with(1);
-        }
-    };
-    let mint_port = match listener.local_addr() {
-        Ok(addr) => addr.port(),
-        Err(e) => {
-            eprintln!("FAILED to read the test mint's address: {e}");
-            exit_with(1);
-        }
-    };
-    drop(listener); // the server below re-binds it; this was only to pick a port
-    let mint_url = format!("http://127.0.0.1:{mint_port}");
-
-    if advertised_mint != "<none>" && advertised_mint != mint_url {
-        eprintln!(
-            "WARNING: the payee advertises mint {advertised_mint}, but this driver funds at \
-             {mint_url}. The payee stores whatever it is told and refuses payments it cannot \
-             verify, so this run proves the WIRE works, not that the payee trusts this mint."
-        );
-    }
-
-    // The mint has to actually listen, because the payer's funding swap goes over
-    // HTTP via `ReqwestClientNetworking` (not the in-memory shortcut) — this driver
-    // is meant to look like a real payer, so the mint leg is real too.
-    let mint_for_server = helper.mint();
-    let server_config = TestMintConfig::for_port(mint_port);
-    let server = tokio::spawn(async move {
-        serve_existing_mint_with_shutdown(mint_for_server, server_config, async {
-            // Runs until the driver exits; the process teardown ends it.
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-    });
-
-    // Give the listener a moment to come up, then prove it did rather than
-    // sleeping and hoping.
-    let mint_info_url = format!("{mint_url}/v1/info");
-    let mut ready = false;
-    for _ in 0..50 {
-        match reqwest::get(&mint_info_url).await {
-            Ok(resp) if resp.status().is_success() => {
-                ready = true;
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-        }
-    }
-    if !ready {
-        eprintln!("FAILED: the in-process test mint never answered {mint_info_url}");
-        server.abort();
-        exit_with(1);
-    }
-
+    marker(&format!("PAYER_MINT_EXTERNAL url={mint_url}"));
     let sender_secret = SecretKey::generate();
     let receiver_secret = SecretKey::generate();
 
     let payer_db = tempdir.path().join("payer.sqlite");
-    let mut client_host = match ConfigurableClientHost::open_sqlite(
-        payer_db.to_str().unwrap_or("payer.sqlite"),
-    ) {
-        Ok(host) => host,
-        Err(e) => {
-            eprintln!("FAILED to open the payer store: {e}");
-            server.abort();
-            exit_with(1);
-        }
-    };
+    let mut client_host =
+        match ConfigurableClientHost::open_sqlite(payer_db.to_str().unwrap_or("payer.sqlite")) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("FAILED to open the payer store: {e}");
+                exit_with(1);
+            }
+        };
     client_host.add_key(sender_secret.clone());
 
     // Two mint clients, on purpose. `SpilmanClientBridge` consumes its networking by
@@ -293,7 +310,6 @@ async fn main() {
     let bridge_networking = match mint_networking() {
         Ok(networking) => networking,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to build the mint networking client: {e}");
             exit_with(1);
         }
@@ -301,26 +317,16 @@ async fn main() {
     let swap_networking = match mint_networking() {
         Ok(networking) => networking,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to build the mint networking client: {e}");
             exit_with(1);
         }
     };
     let client = SpilmanClientBridge::new(client_host, bridge_networking);
 
-    let proofs = match helper.mint_proofs(CHANNEL_CAPACITY * 2).await {
-        Ok(proofs) => proofs,
-        Err(e) => {
-            eprintln!("FAILED to mint test proofs: {e}");
-            server.abort();
-            exit_with(1);
-        }
-    };
     let proofs_json = match serde_json::to_string(&proofs) {
         Ok(json) => json,
         Err(e) => {
             eprintln!("FAILED to serialize test proofs: {e}");
-            server.abort();
             exit_with(1);
         }
     };
@@ -328,7 +334,6 @@ async fn main() {
         Ok(token) => token,
         Err(e) => {
             eprintln!("FAILED to build the funding token: {e}");
-            server.abort();
             exit_with(1);
         }
     };
@@ -344,10 +349,7 @@ async fn main() {
         64,
     ) {
         Ok(opening) => opening,
-        Err(e) => {
-            server.abort();
-            fail("prepare the channel open", &e)
-        }
+        Err(e) => fail("prepare the channel open", &e),
     };
     let channel_id = opening.channel_id().to_string();
     let capacity = opening.capacity();
@@ -355,19 +357,14 @@ async fn main() {
     // The two-phase open, in the only order that protects money: persist the
     // restore material, THEN swap.
     if let Err(e) = opening.save_opening(&client) {
-        server.abort();
         fail("persist the opening record", &e);
     }
     if let Err(e) = opening.submit_funding_swap(&swap_networking) {
-        server.abort();
         fail("submit the funding swap", &e);
     }
     let completed = match opening.finish_open(&client) {
         Ok(completed) => completed,
-        Err(e) => {
-            server.abort();
-            fail("complete the channel open", &e)
-        }
+        Err(e) => fail("complete the channel open", &e),
     };
 
     // The registration payload is built from upstream's own `Payment`, so the bytes
@@ -375,7 +372,6 @@ async fn main() {
     let registration_payment = match client.sign_channel_registration(&channel_id) {
         Ok(payment) => payment,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to sign the channel registration: {e}");
             exit_with(1);
         }
@@ -383,7 +379,6 @@ async fn main() {
     let keyset_id = match parse_keyset_info_from_json(&keyset_info_json) {
         Ok(info) => info.keyset_id,
         Err(e) => {
-            server.abort();
             eprintln!("FAILED to parse the keyset info this driver just fetched: {e}");
             exit_with(1);
         }
@@ -400,10 +395,7 @@ async fn main() {
             req.with_channel_secret(&sender_secret, &receiver_secret.public_key().to_hex())
         }) {
         Ok(req) => req.with_keyset_info_json(keyset_info_json.clone()),
-        Err(e) => {
-            server.abort();
-            fail("build the registration payload", &e)
-        }
+        Err(e) => fail("build the registration payload", &e),
     };
 
     // `finish_open` returns the mint's own view of the channel; the funding proofs
@@ -423,8 +415,9 @@ async fn main() {
             "FAILED: the mint completed a channel named {}, but the payer prepared {channel_id}",
             completed.channel_id
         );
-        server.abort();
-        marker(&format!("PAYER_FAILED=mint-channel-id-mismatch channel_id={channel_id}"));
+        marker(&format!(
+            "PAYER_FAILED=mint-channel-id-mismatch channel_id={channel_id}"
+        ));
         exit_with(1);
     }
 
@@ -437,10 +430,7 @@ async fn main() {
     // ── STEP 3: register it with the running payee ──────────────────────────
     let outcome = match payee.register_channel(&registration).await {
         Ok(outcome) => outcome,
-        Err(e) => {
-            server.abort();
-            fail("POST /spilman/channel", &e)
-        }
+        Err(e) => fail("POST /spilman/channel", &e),
     };
     step(
         3,
@@ -448,23 +438,19 @@ async fn main() {
         &format!("outcome={outcome} channel_id={channel_id} keyset={keyset_id}"),
     );
 
+    phase_gate(phase_dir.as_deref(), "funded").await;
+
     // ── STEP 4: sign and submit a payment ───────────────────────────────────
     let payment = match payer::step_payment(&client, &channel_id, PAYMENT_RAW_UNITS) {
         Ok(payment) => payment,
-        Err(e) => {
-            server.abort();
-            fail("sign a balance update", &e)
-        }
+        Err(e) => fail("sign a balance update", &e),
     };
     let paid = match payee
         .submit_payment(&channel_id, payment.balance, &payment.signature)
         .await
     {
         Ok(outcome) => outcome,
-        Err(e) => {
-            server.abort();
-            fail("POST /spilman/payment", &e)
-        }
+        Err(e) => fail("POST /spilman/payment", &e),
     };
     step(
         4,
@@ -479,10 +465,7 @@ async fn main() {
     // this is the payee saying what it *holds*.
     let status = match payee.status(&channel_id).await {
         Ok(status) => status,
-        Err(e) => {
-            server.abort();
-            fail("GET /spilman/status", &e)
-        }
+        Err(e) => fail("GET /spilman/status", &e),
     };
     let credited = status.get("balance").and_then(serde_json::Value::as_u64);
     step(
@@ -500,8 +483,6 @@ async fn main() {
         ),
     );
 
-    server.abort();
-
     if credited != Some(PAYMENT_RAW_UNITS) {
         eprintln!(
             "FAILED: the payee reports balance {credited:?}, but the payer signed \
@@ -518,15 +499,79 @@ async fn main() {
     // balance the payer signed. `payee_credited` is the payee's own read-back, not the
     // driver's assumption — a 200 on step 4 would only mean "accepted".
     marker(&format!(
-        "PAYER_SETTLE_OK channel_id={channel_id} balance={PAYMENT_RAW_UNITS} payee_credited={}",
+        "PAYER_PAYMENT_OK channel_id={channel_id} balance={PAYMENT_RAW_UNITS} payee_credited={}",
         credited.unwrap_or(0)
     ));
 
+    phase_gate(phase_dir.as_deref(), "paid").await;
+    marker("PAYER_SETTLEMENT_NOT_IMPLEMENTED");
     println!();
     println!(
         "OK: channel {channel_id} registered, paid {PAYMENT_RAW_UNITS} raw unit(s), and the \
          payee holds exactly that balance."
     );
-    drop(helper); // keep the mint (and its task) alive until after the last request
     exit_with(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_http_funding_opens_real_channel() {
+        use cdk_spilman_test_mint::{
+            serve_existing_mint_with_shutdown, TestMintConfig, TestMintHelper,
+        };
+        let helper = TestMintHelper::new().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = TestMintConfig::for_port(port);
+        let url = config.base_url.clone();
+        let server = tokio::spawn(serve_existing_mint_with_shutdown(
+            helper.mint(),
+            config,
+            std::future::pending::<()>(),
+        ));
+        let http = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..100 {
+            if http.get(format!("{url}/v1/info")).send().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready);
+        let (info, proofs) = fund_external(&url).await.unwrap();
+        assert!(!proofs.is_empty());
+        let token =
+            build_cashu_b_token(&url, "sat", &serde_json::to_string(&proofs).unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sender = SecretKey::generate();
+        let receiver = SecretKey::generate();
+        let mut host =
+            ConfigurableClientHost::open_sqlite(dir.path().join("test.sqlite").to_str().unwrap())
+                .unwrap();
+        host.add_key(sender.clone());
+        let client = SpilmanClientBridge::new(host, mint_networking().unwrap());
+        let mut opening = ChannelOpening::prepare(
+            &client,
+            &token,
+            &receiver.public_key().to_hex(),
+            &sender.public_key().to_hex(),
+            payer::now_seconds() + DEFAULT_CHANNEL_LIFETIME_SECS,
+            &info,
+            64,
+        )
+        .unwrap();
+        opening.save_opening(&client).unwrap();
+        opening
+            .submit_funding_swap(&mint_networking().unwrap())
+            .unwrap();
+        let completed = opening.finish_open(&client).unwrap();
+        assert_eq!(completed.mint_url, url);
+        assert_eq!(completed.channel_id, opening.channel_id());
+        server.abort();
+    }
 }
