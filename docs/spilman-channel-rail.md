@@ -57,10 +57,24 @@ neither can drift.
 ### 2.3 The HTTP surface is real, and its disabled state is observable
 
 ```
-GET  /spilman/params   mint URL + rate (public config; no state leaked)
+GET  /spilman/params   mint URL + rate + the payee's receiver pubkey
+                       (public config; no state leaked)
 POST /spilman/payment  a signed balance update
 GET  /spilman/status   the payee's view of one channel
 ```
+
+`/spilman/params` advertises `receiver_pubkey`: the compressed secp256k1 (33-byte,
+`02…`/`03…`) hex public key of the key this payee signs channel closes with. It is the
+same encoding `registration.rs` parses out of `params_json`, so a payer can copy the value
+straight into the channel parameters. It is derived from
+`<config dir>/spilman-receiver.key` (`0600`, created once, reloaded on every boot), so it
+is **stable across restarts** — a per-boot key would leave every channel opened before
+the restart uncloseable. A payee that holds no key (read-only/verification-only context)
+advertises `null` and refuses to settle.
+
+The field is additive: existing consumers that ignore it keep working, and
+`receiver_key_is_acceptable` in `payee_host.rs` compares an offered key against this one,
+returning `false` only when the host genuinely holds no key.
 
 The mount is **conditional on the rail existing**. With Spilman off, no route is
 mounted at all, so every `/spilman` path 404s **without a handler running**.

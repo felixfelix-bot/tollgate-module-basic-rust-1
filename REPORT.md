@@ -1,3 +1,135 @@
+# REPORT — receiver-key binding in the Spilman rail
+
+Branch `pr/spilman-receiver-binding`, base `origin/pr/spilman-channel-rail` @ `cc02326`.
+The older report below ("Path A") is a different phase of this branch's lineage and is
+kept verbatim for its own evidence; nothing in it is superseded by this section.
+
+## The gap, precisely
+
+A Spilman channel names a `receiver_pubkey` in its params. The payee signs every close
+with *its own* receiver key (`LedgerPayeeHost::sign_with_tweaked_key`). Nothing on the
+wire told a payer which key that was, and `examples/spilman_payer.rs` generated a random
+one per run. Measured on real hardware: the channel funded at the mint, then every
+`POST /spilman/close` answered **HTTP 409**, forever — the money sat in a channel the
+payee could never close. The suite was green throughout because both halves were
+internally consistent and neither half ever asked the other what key it held.
+
+## What changed
+
+1. **A persisted receiver key.** New `src/spilman/receiver_key.rs`. `main.rs` loads
+   `<config dir>/spilman-receiver.key` (production `/etc/tollgate/spilman-receiver.key`)
+   via `receiver_key::default_path()`, which resolves through the existing
+   `config::config_dir()` so `TOLLGATE_TEST_CONFIG_DIR` moves it in tests. Tested
+   properties:
+   - created once with `0600` **at creation** (`OpenOptionsExt::mode`), hex + newline;
+   - reloaded on every boot — same file, same key (restart test);
+   - corrupt/empty/short/zero file is a **refusal**, never a quiet regeneration
+     (regenerating would orphan every open channel);
+   - `create_new` + re-read on `AlreadyExists`, so two simultaneous boots converge on one
+     key instead of one overwriting the other.
+   `main.rs` exits `78` (EX_CONFIG) if it cannot load the key: a rail that cannot settle
+   must not start pretending it can.
+
+   Deliberately **not** the merchant (Nostr) identity that `main.rs` used before: a
+   compressed secp256k1 key shares its x-coordinate with the x-only Nostr pubkey, so
+   advertising it on a public endpoint would link the router's identity to its payment
+   rail. One extra file buys unlinkability.
+
+2. **`GET /spilman/params` advertises `receiver_pubkey`.** Additive field on
+   `ParamsResponse`; `Some(<33-byte compressed hex>)`, or `null` when the rail holds no
+   key. Encoding matches `registration.rs` / `PublicKey::from_hex` (`02…`/`03…`). Docs:
+   `docs/spilman-channel-rail.md` §2.3.
+
+3. **The policy is honest.** `receiver_key_is_acceptable` compares the offered key with
+   `self.receiver.public_key()`; `false` only when the host holds no key (the read-only
+   `LedgerPayeeHost::new` shape). `mint_and_keyset_is_acceptable` was made honest where
+   it can be: `for_close` is constructed with the rail's own configured `mint_url` and
+   the keyset JSON fetched *from that mint*, so the comparison is against trusted bytes.
+   It stays `false` for a host with neither — there is no cached keyset to validate
+   against and inventing one would be a lie.
+
+   `SpilmanRail::register_channel` additionally refuses a channel whose params name a
+   foreign `receiver_pubkey` (`enforce_receiver_binding`) **before** persisting, using
+   that same trait method: one implementation of the rule, at the door rather than at
+   settlement. A keyless rail is the documented read-only carve-out.
+
+4. **The payer opens against the advertised key.** `examples/spilman_payer.rs` fetches
+   `/spilman/params`, requires `receiver_pubkey` (refusing missing/null/non-string/empty/
+   unparseable), and uses it for both the open and the registration. The only ephemeral
+   key left in the production path is the **sender's**, named as such. The one remaining
+   `SecretKey::generate()` for a receiver lives inside `#[cfg(test)]`, in the in-process
+   funding self-test that talks to a test mint and no payee — a throwaway by
+   construction. The seller-advertised mint still wins; a `--mint-url` mismatch still
+   fails before funding.
+
+## Evidence — RED first, then GREEN
+
+| Test | Mutation that makes it fail | Observed |
+|---|---|---|
+| `tests/spilman_receiver_binding.rs::a_channel_opened_against_the_advertised_key_settles_over_http` | `receiver_key_is_acceptable` → `false` | FAILED at registration, GREEN settles |
+| same | params `receiver_pubkey` → `None` | FAILED at the params assertion |
+| `…::a_channel_for_a_foreign_receiver_key_is_refused_at_registration` | params field removed | FAILED |
+| `spilman_mount_test::params_advertises_the_receiver_key_the_payee_accepts` | field removed / policy `false` | RED before impl, GREEN after |
+| `payee_host::tests::a_host_accepts_only_its_own_receiver_key` | policy → `false` | RED→GREEN |
+| `examples/spilman_payer.rs::the_production_path_generates_no_receiver_key` | re-add `let receiver_secret = SecretKey::generate();` | FAILED (2 generates, 1 allowed) |
+| `receiver_key::tests::{the_same_key_is_reloaded_after_a_restart, a_new_key_is_persisted_with_owner_only_permissions, a_corrupt_file_is_refused_and_left_untouched}` | regenerate per call / mode 0644 / silent replacement | RED→GREEN |
+
+First RED run of the in-crate tests: `cargo test --lib spilman` → **2 failed** (params
+advertisement + host policy) before any production change.
+
+The settlement test is end-to-end over real sockets: an in-process `cdk-spilman-test-mint`
+HTTP server, the payee on an `axum` router, a real `SpilmanPayerDriver` opening and funding
+the channel with the advertised key, `POST /spilman/payment`, then `POST /spilman/close`;
+it asserts the payee's receipt and that the payer's `CooperativeSettlement` unblinds the
+returned proofs (`receiver_sum=3, sender_sum=125, total=128`). The swap against the mint
+really executed: proofs were signed, swapped, and unblinded.
+
+## Gates (all observed, exit 0)
+
+- `cargo test --all-targets --features test-support,payer-driver -- --include-ignored`
+  → **327 passed, 0 failed**.
+- `cargo test --all-targets -- --include-ignored` → **306 passed, 0 failed**.
+- `cargo clippy --all-targets -- -D warnings` → 0.
+- `cargo clippy --all-targets --features test-support,payer-driver -- -D warnings` → 0.
+- `cargo build --release --target x86_64-unknown-linux-musl --bin tollgate-module-basic-rust --features payer-driver --example spilman-payer`
+  → 0; both artefacts `ELF 64-bit LSB pie executable, x86-64, static-pie linked`.
+  aarch64 not attempted (another agent owns that toolchain).
+
+No existing assertion was weakened; edits to existing tests are fixtures that now
+install a receiver key (which production always did) plus the new params assertion.
+
+## What is NOT proven
+
+1. **No public mint, no real sats.** Every settlement used `cdk-spilman-test-mint` over
+   loopback HTTP. Real code over a real socket, but a test mint with a fake wallet: no
+   Lightning, no mainnet, no money.
+2. **No physical-router run.** Builds and the suite are x86_64; this branch was not
+   deployed to `tollgate-0195` (aarch64, blocked on the toolchain another agent owns). The
+   409 was measured on hardware; its fix is measured in-process here.
+3. **The payer's `main()` is not executed by the suite.**
+   `the_production_path_generates_no_receiver_key` is a source-level guard: no behavioural
+   test can observe which key a separate binary chose without a live payee and mint. It
+   catches the specific regression (a random receiver key reappearing), not e.g. a caller
+   that ignores the helper's return value.
+4. **Restart durability is tested at the file and rail level, not across a real process
+   restart** — `load_or_create` twice in one process plus a rail rebuild. The mechanism is
+   a plain file read, but "process A wrote it, process B read it after exec" is not
+   literally asserted.
+5. **Key-file permissions on the deployed filesystem** (overlay/read-only rootfs) are
+   untested; `0600` is asserted on tmpfs only. A read-only config dir makes `main.rs` exit
+   `78` — loud, but unverified on the device.
+6. **`mint_and_keyset_is_acceptable` is honest but not load-bearing on the live close
+   path**: upstream's close preparation does not consult it (verified by reading
+   `bridge.rs`), so it is unit-tested only. It is what a funding-time policy call would
+   use, but nothing in this module calls it today.
+7. **A payee with no receiver key still accepts registrations** (documented carve-out).
+   It cannot settle anything, so it cannot lose money, but it can accumulate uncloseable
+   records. Production always installs a key via `main.rs`.
+
+---
+
+# Appendix — earlier report (Path A phase, unchanged)
+
 # REPORT — Path A (tollgate-module-basic-rust)
 
 Reference: issue #12. Branch: stacked on `fix/tip-conformance-and-cdk-018` (#11).

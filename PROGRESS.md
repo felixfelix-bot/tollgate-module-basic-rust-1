@@ -148,3 +148,23 @@ reach the payee over HTTP and be turned into a `ChannelFundingRecord`. Next step
 registration route — accept params + funding proofs, validate them against the channel id
 (`validate_new_channel_funding`), persist via `save_channel_funding` — in front of the now
 working `record_payment`.
+
+## Phase 5 — receiver-key binding (GREEN, `pr/spilman-receiver-binding`)
+
+- `receiver_pubkey` advertised on `GET /spilman/params`; `SpilmanRail::receiver_pubkey()`
+  exposes the rail's key. `null` when the rail holds none. — done.
+- New persisted key at `<config dir>/spilman-receiver.key` (`src/spilman/receiver_key.rs`):
+  hex, `0600`, `create_new` (race-loser re-reads the winner), refuses corrupt files,
+  reloaded on every boot; `main.rs` exits `EX_CONFIG` if it cannot load. Replaces the
+  merchant-identity derivation, which would have linked the public params endpoint to the
+  Nostr pubkey. — done, 4 unit tests + restart test.
+- `receiver_key_is_acceptable` now compares against our own key (`None` → `false`).
+  `mint_and_keyset_is_acceptable` now compares against the `(mint_url, keyset_json)` the
+  close path was given; `false` when the host was built without them. — done.
+- `SpilmanRail::register_channel` refuses a channel addressed to a foreign receiver key
+  (`enforce_receiver_binding`), so the failure is at the door, not at settlement. — done.
+- Payer `examples/spilman_payer.rs` uses the advertised key; single ephemeral key is the
+  sender's; mint mismatch still fails before funding. — done.
+- RED observed for every layer (see REPORT.md "Evidence"). — done.
+- Full gates green: 327/0 with `test-support,payer-driver`, 306/0 default, clippy 0 both,
+  x86_64-musl build 0. — done.
