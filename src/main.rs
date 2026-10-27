@@ -115,11 +115,32 @@ async fn main() {
     // A config error here is fatal on purpose (EX_CONFIG): an operator who opted
     // into the wholesale rail and got the config wrong must not silently fall back
     // to "channel payments are refused" or, worse, to a ledger that forgets.
+    //
+    // The rail is given the payee's **persisted receiver key** — a dedicated
+    // `spilman-receiver.key` (0600, created once, reloaded on every boot). It is what
+    // `/spilman/params` advertises and what every close is signed with, so it must be
+    // stable across restarts: a per-boot key would make every channel opened before the
+    // restart unsettleable. It is deliberately NOT the merchant (Nostr) identity: the
+    // compressed key shares its x-coordinate with the x-only Nostr pubkey, so
+    // advertising it on a public endpoint would link the router's identity to its rail.
     let spilman_rail = match spilman::SpilmanRail::from_config(&config_obj.spilman) {
         Ok(rail) => rail.map(|rail| {
-            let receiver_key =
-                cashu::nuts::SecretKey::from_slice(&identity.secret_key.secret_bytes())
-                    .expect("merchant identity is a valid secp256k1 scalar");
+            let key_path = spilman::receiver_key::default_path();
+            let receiver_key = match spilman::receiver_key::load_or_create(&key_path) {
+                Ok(key) => key,
+                Err(e) => {
+                    // FAIL CLOSED: without a key this module cannot settle a channel,
+                    // and generating a throwaway one would orphan every channel already
+                    // opened against the advertised key.
+                    eprintln!("FATAL: spilman receiver key: {e}");
+                    std::process::exit(78); // EX_CONFIG
+                }
+            };
+            tracing::info!(
+                path = %key_path.display(),
+                receiver_pubkey = %receiver_key.public_key(),
+                "spilman receiver key loaded"
+            );
             Arc::new(rail.with_receiver_key(receiver_key))
         }),
         Err(e) => {
@@ -131,6 +152,10 @@ async fn main() {
         tracing::info!(
             in_bytes_per_millisat = rail.in_bytes_per_millisat(),
             mint = rail.mint_url().unwrap_or("<none>"),
+            receiver_pubkey = rail
+                .receiver_pubkey()
+                .map(|k| k.to_hex())
+                .unwrap_or_else(|| "<none>".to_string()),
             "spilman wholesale rail ENABLED"
         );
     } else {

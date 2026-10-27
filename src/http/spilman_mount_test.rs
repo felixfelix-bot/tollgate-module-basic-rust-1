@@ -32,6 +32,19 @@ fn state_disabled() -> AppState {
 
 /// A state with the rail enabled and a real ledger on disk.
 fn state_enabled(dir: &std::path::Path) -> AppState {
+    state_with_spilman(dir, None)
+}
+
+/// An enabled rail that **holds a receiver key**, which is what a production
+/// payee always has (`main.rs`) and what `/spilman/params` must advertise.
+fn state_enabled_with_receiver(dir: &std::path::Path, receiver: &cashu::nuts::SecretKey) -> AppState {
+    state_with_spilman(dir, Some(receiver))
+}
+
+fn state_with_spilman(
+    dir: &std::path::Path,
+    receiver: Option<&cashu::nuts::SecretKey>,
+) -> AppState {
     let cfg = Config {
         spilman: SpilmanConfig {
             enabled: true,
@@ -44,6 +57,10 @@ fn state_enabled(dir: &std::path::Path) -> AppState {
     let rail = SpilmanRail::from_config(&cfg.spilman)
         .expect("enabled config is not an error")
         .expect("enabled config must build a rail");
+    let rail = match receiver {
+        Some(key) => rail.with_receiver_key(key.clone()),
+        None => rail,
+    };
     build_state(cfg, Some(Arc::new(rail)))
 }
 
@@ -186,6 +203,160 @@ async fn spilman_paths_respond_when_enabled() {
         StatusCode::OK,
         "/spilman/params must answer when the rail is enabled"
     );
+}
+
+/// `/spilman/params` must advertise the receiver key the payee will accept, or no
+/// payer can build a channel the payee will ever settle.
+///
+/// This is the assertion the previous suite lacked: `receiver_key_is_acceptable` was
+/// hardcoded `false` and `params` advertised no key at all, so the whole channel
+/// lifecycle was dead on real hardware (HTTP 409 at `POST /spilman/close`) while
+/// every unit test stayed green.
+#[tokio::test]
+async fn params_advertises_the_receiver_key_the_payee_accepts() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use crate::spilman::LedgerPayeeHost;
+    use cdk_spilman::SpilmanHost;
+    use std::sync::Arc as StdArc;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let rail = StdArc::clone(state.spilman.as_ref().expect("rail"));
+
+    let resp = create_test_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/spilman/params")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router call");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("params json");
+
+    // Additive: the fields a payer already reads must still be there.
+    assert_eq!(body["status"], 1, "{body}");
+    assert_eq!(body["in_bytes_per_millisat"], 22_021, "{body}");
+    assert!(
+        body.get("mint_url").is_some(),
+        "params must still name a mint: {body}"
+    );
+
+    let advertised = body["receiver_pubkey"]
+        .as_str()
+        .unwrap_or_else(|| panic!("params must advertise receiver_pubkey: {body}"));
+    let parsed = cashu::nuts::PublicKey::from_hex(advertised)
+        .expect("the advertised key must be a compressed secp256k1 key");
+    assert_eq!(parsed, receiver.public_key(), "{body}");
+
+    // The two ends must agree: what params advertises is what the host accepts, and
+    // the host still refuses somebody else's key.
+    let host_ledger = crate::spilman::ledger::ChannelLedger::open_in_memory().expect("ledger");
+    let host = LedgerPayeeHost::for_close(
+        &host_ledger,
+        &receiver,
+        rail.mint_url().unwrap_or_default(),
+        "{}",
+    );
+    assert!(
+        host.receiver_key_is_acceptable(&parsed),
+        "the advertised key must be one the payee accepts"
+    );
+    assert!(
+        !host.receiver_key_is_acceptable(&cashu::nuts::SecretKey::generate().public_key()),
+        "the payee must still refuse a key it does not hold"
+    );
+}
+
+/// A rail with no receiver key must NOT advertise one. An advertisement that names a
+/// key the payee cannot sign with is worse than none: the payer would open a channel
+/// that can never settle.
+#[tokio::test]
+async fn params_advertises_no_receiver_key_when_the_rail_holds_none() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let resp = create_test_router(state_enabled(dir.path()))
+        .oneshot(
+            Request::builder()
+                .uri("/spilman/params")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router call");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("params json");
+    assert_eq!(
+        body["receiver_pubkey"],
+        serde_json::Value::Null,
+        "a keyless rail must advertise null, not a key it cannot sign with: {body}"
+    );
+}
+
+/// The advertised key must be **stable across a restart**.
+///
+/// A per-boot key would silently break every channel: the payee would come back
+/// advertising a different key, and every channel opened against the old one would be
+/// uncloseable. Production loads the key from `<config dir>/spilman-receiver.key`
+/// (`main.rs`), so this asserts the real path: two boots resolve the same file and
+/// derive the same advertisement.
+#[test]
+fn the_advertised_receiver_key_survives_a_restart() {
+    use crate::spilman::receiver_key;
+    use crate::spilman::SpilmanRail;
+
+    let _guard = crate::config::tests::env_guard();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+
+    let path = receiver_key::default_path();
+    assert_eq!(
+        path,
+        dir.path().join(receiver_key::RECEIVER_KEY_FILE),
+        "the key must live in the config dir, next to identities.json"
+    );
+
+    // First boot: creates and persists. Second boot: reloads the same file.
+    let first = receiver_key::load_or_create(&path).expect("first boot");
+    let second = receiver_key::load_or_create(&path).expect("second boot");
+    assert_eq!(
+        first.public_key(),
+        second.public_key(),
+        "the receiver key must be reloaded from disk, not regenerated per boot"
+    );
+
+    let ledger_path = dir.path().join("spilman.db");
+    let advertised = SpilmanRail::open(&ledger_path, 22_021, None)
+        .expect("rail")
+        .with_receiver_key(first.clone())
+        .receiver_pubkey()
+        .expect("rail holds a key");
+    assert_eq!(advertised, first.public_key());
+
+    // A restart: same ledger, same key file, same advertisement.
+    let restarted = SpilmanRail::open(&ledger_path, 22_021, None)
+        .expect("rail")
+        .with_receiver_key(second);
+    assert_eq!(
+        restarted.receiver_pubkey().expect("rail holds a key"),
+        advertised,
+        "a restarted payee must advertise the same receiver key"
+    );
+
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
 }
 
 #[tokio::test]

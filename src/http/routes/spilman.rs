@@ -41,11 +41,27 @@ fn rail(state: &AppState) -> Option<Arc<SpilmanRail>> {
 ///
 /// Deliberately does NOT leak the channel ledger or any balance: this is public
 /// configuration, and a discovery endpoint that exposes state is a privacy bug.
+///
+/// # `receiver_pubkey`
+///
+/// The key a payer must name as the channel's `receiver_pubkey`. Without it a payer
+/// can only open a channel against a key of its own choosing — which this payee can
+/// never sign a close with, so the channel would fund at the mint and then fail at
+/// `POST /spilman/close` forever (measured as HTTP 409 on real hardware). It is
+/// `null` when the rail holds no receiver key: advertising a key the payee cannot
+/// sign with is worse than advertising none.
+///
+/// Encoding is `cashu::nuts::PublicKey::to_hex()` — 33-byte compressed secp256k1, the
+/// same encoding `registration.rs` puts in the channel params and the same one
+/// upstream's `PublicKey::from_hex` insists on.
 #[derive(Debug, Serialize)]
 pub struct ParamsResponse {
     pub status: u8,
     pub mint_url: Option<String>,
     pub in_bytes_per_millisat: u64,
+    /// The receiver key this payee will accept a channel for, hex-encoded compressed
+    /// secp256k1. `null` when the rail holds none.
+    pub receiver_pubkey: Option<String>,
 }
 
 pub async fn handle_params(State(state): State<AppState>) -> impl IntoResponse {
@@ -62,6 +78,7 @@ pub async fn handle_params(State(state): State<AppState>) -> impl IntoResponse {
             status: 1,
             mint_url: r.mint_url().map(str::to_string),
             in_bytes_per_millisat: r.in_bytes_per_millisat(),
+            receiver_pubkey: r.receiver_pubkey().map(|key| key.to_hex()),
         })
         .into_response(),
     }

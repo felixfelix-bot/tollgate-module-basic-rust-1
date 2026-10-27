@@ -84,6 +84,21 @@ impl<'a> LedgerPayeeHost<'a> {
             close_keyset: None,
         }
     }
+
+    /// A host that holds `receiver` and no keyset cache.
+    ///
+    /// The shape a **funding-time policy** check needs: the receiver-key question can
+    /// be answered, the keyset question cannot (and answers `false`). Used by
+    /// `SpilmanRail::register_channel` so that the "is this channel addressed to me?"
+    /// decision has exactly one implementation — this trait impl — instead of a second
+    /// copy in the rail.
+    pub fn with_receiver(ledger: &'a ChannelLedger, receiver: &'a cashu::nuts::SecretKey) -> Self {
+        Self {
+            ledger,
+            receiver: Some(receiver),
+            close_keyset: None,
+        }
+    }
 }
 
 /// Read `capacity` out of a channel's serialized params.
@@ -105,22 +120,55 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// The mint and keyset this host will accept a channel against.
+///
+/// `for_close` supplies both explicitly, because the close path fetches the output
+/// keyset from the *configured* mint and nothing else may be substituted. A host with
+/// neither (i.e. [`LedgerPayeeHost::new`], which serves the verification path only)
+/// answers `false`: it holds no keyset cache, so it has no honest way to say a keyset
+/// is the one this payee trusts.
+fn accepts_keyset(close_keyset: Option<(&str, &str)>, mint: &str, keyset_id: &Id) -> bool {
+    let Some((trusted_mint, json)) = close_keyset else {
+        return false;
+    };
+    if trusted_mint != mint {
+        return false;
+    }
+    cdk_spilman::parse_keyset_info_from_json(json)
+        .map(|info| &info.keyset_id == keyset_id)
+        .unwrap_or(false)
+}
+
 impl SpilmanHost for LedgerPayeeHost<'_> {
-    /// NOT ON THE VERIFICATION PATH — funding-time policy, not payment-time.
+    /// Accept a channel only if it is addressed to the receiver key this host holds.
     ///
-    /// `false` is the fail-closed answer: it can only cause upstream to refuse a
-    /// channel, never to accept a payment. This host holds no receiver key, so it
-    /// has no honest way to answer `true`.
-    fn receiver_key_is_acceptable(&self, _receiver_pubkey: &PublicKey) -> bool {
-        false
+    /// # Why this is a real comparison and not a constant
+    ///
+    /// The payer names the receiver pubkey in the channel params, and every close
+    /// signature this payee produces is signed with **this** key. A host that
+    /// answered `true` for anything would let a payer open a channel against a
+    /// throwaway key; the open would fund at the mint and the close would then fail
+    /// forever (`sign_with_tweaked_key` → "receiver key mismatch"), which is exactly
+    /// the HTTP 409 seen at `POST /spilman/close` on real hardware.
+    ///
+    /// `false` remains the answer when the host holds no key at all (read-only ledger
+    /// contexts, e.g. [`LedgerPayeeHost::new`]): such a host cannot sign a close, so
+    /// there is no key it could honestly accept.
+    fn receiver_key_is_acceptable(&self, receiver_pubkey: &PublicKey) -> bool {
+        match self.receiver {
+            Some(key) => &key.public_key() == receiver_pubkey,
+            None => false,
+        }
     }
 
-    /// NOT ON THE VERIFICATION PATH — funding-time policy, not payment-time.
+    /// Accept exactly the *(mint, keyset)* pair this host was constructed with.
     ///
-    /// Same reasoning as `receiver_key_is_acceptable`: `false` refuses, and this
-    /// host holds no keyset cache to accept against.
-    fn mint_and_keyset_is_acceptable(&self, _mint: &str, _keyset_id: &Id) -> bool {
-        false
+    /// Honest rather than constant: `for_close` is given the mint URL from the rail's
+    /// own configured `mint_url` and the keyset JSON fetched from that mint, so the
+    /// comparison is against real, trusted bytes. A host constructed without them
+    /// answers `false`.
+    fn mint_and_keyset_is_acceptable(&self, mint: &str, keyset_id: &Id) -> bool {
+        accepts_keyset(self.close_keyset, mint, keyset_id)
     }
 
     /// The channel's durable funding record — the five values upstream's
@@ -362,5 +410,72 @@ impl SpilmanHost for LedgerPayeeHost<'_> {
             message_hex,
             tweak_scalar_hex,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spilman::ledger::ChannelLedger;
+
+    /// A self-consistent keyset blob, in the shape `parse_keyset_info_from_json` reads.
+    fn keyset_json() -> (String, Id) {
+        let keys = cashu::nuts::Keys::new(
+            [(
+                cashu::Amount::from(1u64),
+                cashu::nuts::SecretKey::generate().public_key(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let keyset_id = Id::v1_from_keys(&keys);
+        let json = serde_json::json!({
+            "keysetId": keyset_id.to_string(),
+            "unit": "sat",
+            "inputFeePpk": 0,
+            "keys": keys.iter()
+                .map(|(amount, key)| (amount.to_string(), key.to_hex()))
+                .collect::<std::collections::BTreeMap<String, String>>(),
+        })
+        .to_string();
+        (json, keyset_id)
+    }
+
+    /// The policy is only honest if it answers for the key this host actually holds.
+    ///
+    /// Reverting `receiver_key_is_acceptable` to `false` makes the first assertion
+    /// fail, which is exactly the regression that let a whole suite stay green while
+    /// no real payer could ever be accepted.
+    #[test]
+    fn a_host_accepts_only_its_own_receiver_key() {
+        let ledger = ChannelLedger::open_in_memory().expect("ledger");
+        let (json, keyset_id) = keyset_json();
+        let ours = cashu::nuts::SecretKey::generate();
+        let theirs = cashu::nuts::SecretKey::generate();
+
+        let host = LedgerPayeeHost::for_close(&ledger, &ours, "https://mint.example", &json);
+        assert!(
+            host.receiver_key_is_acceptable(&ours.public_key()),
+            "the payee must accept a channel addressed to the key it holds"
+        );
+        assert!(
+            !host.receiver_key_is_acceptable(&theirs.public_key()),
+            "the payee must refuse a channel addressed to somebody else's key"
+        );
+
+        // A host with no key has no honest way to say yes: still fail closed.
+        let keyless = LedgerPayeeHost::new(&ledger);
+        assert!(
+            !keyless.receiver_key_is_acceptable(&ours.public_key()),
+            "a host that holds no receiver key must refuse, even the right key"
+        );
+
+        // And the keyset policy answers for the keyset this host holds.
+        let (other_json, other_id) = keyset_json();
+        assert!(host.mint_and_keyset_is_acceptable("https://mint.example", &keyset_id));
+        assert!(!host.mint_and_keyset_is_acceptable("https://other.example", &keyset_id));
+        assert!(!host.mint_and_keyset_is_acceptable("https://mint.example", &other_id));
+        assert!(!keyless.mint_and_keyset_is_acceptable("https://mint.example", &keyset_id));
+        let _ = other_json;
     }
 }

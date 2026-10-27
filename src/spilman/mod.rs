@@ -40,6 +40,9 @@ pub mod payer_driver;
 pub mod payment_units;
 pub mod pricing;
 pub mod rail;
+/// The payee's persisted receiver key. Public so `/spilman/params` can advertise it and
+/// so the module's restart/durability properties are testable from outside.
+pub mod receiver_key;
 pub mod registration;
 
 use async_trait::async_trait;

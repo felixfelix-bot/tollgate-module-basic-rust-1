@@ -109,7 +109,13 @@ impl SpilmanRail {
         self.mint_url.as_deref()
     }
 
-    /// Bytes per millisat in use (both directions).
+    /// The receiver (payee) public key this rail signs channel closes with, if it holds
+    /// one. `None` means this rail cannot settle a channel at all, and must not
+    /// advertise a key it cannot sign with.
+    pub fn receiver_pubkey(&self) -> Option<cashu::nuts::PublicKey> {
+        self.receiver_key.as_ref().map(|key| key.public_key())
+    }
+
     /// Bytes of access a given **raw channel balance** buys at this rail's rate.
     ///
     /// The access path needs the inverse of `authorize_bytes`: it holds a verified
@@ -124,6 +130,7 @@ impl SpilmanRail {
         Ok(self.pricing.bytes_for_millisats(millisats))
     }
 
+    /// Bytes per millisat in use (both directions).
     pub fn in_bytes_per_millisat(&self) -> u64 {
         self.pricing.in_bytes_per_millisat
     }
@@ -160,7 +167,57 @@ impl SpilmanRail {
         // Validate against upstream's own channel reconstruction, then store
         // compare-and-swap. Validation failure means nothing is written.
         let record = crate::spilman::registration::validate_registration(req)?;
+        self.enforce_receiver_binding(&record)?;
         self.ledger.register_channel_funding(&record)
+    }
+
+    /// Refuse a channel addressed to a receiver key this payee does not hold.
+    ///
+    /// # Why registration must consult this
+    ///
+    /// A channel names its `receiver_pubkey` in the params, and every close signature
+    /// this payee produces is made with **its own** receiver key
+    /// (`LedgerPayeeHost::sign_with_tweaked_key`). A channel addressed to any other
+    /// key therefore funds at the mint and then can never settle: the payer's money
+    /// sits in a channel the payee cannot close, and every `POST /spilman/close` is a
+    /// 409. That is the gap this refuses at the door instead of discovering at
+    /// settlement time.
+    ///
+    /// # The `None` case
+    ///
+    /// A rail with no receiver key cannot settle anything, so there is nothing to
+    /// compare against — this is the read-only / verification-only shape
+    /// (`LedgerPayeeHost::new`), and `receiver_key_is_acceptable` answers `false`
+    /// there. Production always installs a key (`main.rs` loads it from
+    /// `<config dir>/spilman-receiver.key`), so the check is live on every real
+    /// deployment.
+    fn enforce_receiver_binding(
+        &self,
+        record: &crate::spilman::ChannelFundingRecord,
+    ) -> Result<(), SpilmanError> {
+        let Some(ours) = self.receiver_key.as_ref() else {
+            return Ok(());
+        };
+        let refused = |detail: String| SpilmanError::InvalidRegistration {
+            channel_id: record.channel_id.clone(),
+            detail,
+        };
+        let params: serde_json::Value =
+            serde_json::from_str(&record.params_json).map_err(|e| refused(e.to_string()))?;
+        let offered = params["receiver_pubkey"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no receiver_pubkey".to_string()))?;
+        let offered = cashu::nuts::PublicKey::from_hex(offered)
+            .map_err(|e| refused(format!("receiver_pubkey is not a public key: {e}")))?;
+        let host = LedgerPayeeHost::with_receiver(&self.ledger, ours);
+        if !cdk_spilman::SpilmanHost::receiver_key_is_acceptable(&host, &offered) {
+            return Err(refused(format!(
+                "channel receiver_pubkey {offered} is not this payee's ({}); \
+                 a channel for another key can never be settled here",
+                ours.public_key()
+            )));
+        }
+        Ok(())
     }
 
     /// The funding record this payee holds for a channel, if any.
