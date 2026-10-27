@@ -264,6 +264,14 @@ mod tests {
         INIT.call_once(|| {
             // Redirect config/identity paths to a temp dir so tests
             // don't try to write to /etc/tollgate (fails on CI runners).
+            //
+            // The env var is process-global, and other tests assert on it
+            // (`config::tests::config_dir_reports_correct_directory` removes it and
+            // expects the default). Setting it *outside* the shared guard let it land
+            // between that test's `remove_var` and its assertion — a flake that only
+            // appeared once a third suite also touched the variable. Take the same
+            // guard every other env-var test uses.
+            let _g = crate::config::tests::env_guard();
             let dir = std::env::temp_dir().join("tollgate-cli-tests");
             std::fs::create_dir_all(&dir).ok();
             std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", &dir);

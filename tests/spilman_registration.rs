@@ -28,15 +28,13 @@
 //! 3. **The credit is durable and spendable** — `/status` reports the balance and
 //!    `authorize_bytes` allows exactly the bytes that balance buys.
 //!
-//! # The one thing it is careful NOT to claim
+//! # The payee's identity is real, not implied
 //!
-//! The payee's configured `mint_url` is a *different* string from the test mint's
-//! URL (`https://mint.example` vs `http://127.0.0.1:<port>`), because
-//! `LedgerPayeeHost::mint_and_keyset_is_acceptable` returns `false` — this payee has
-//! no trusted-(mint, keyset) registry and refuses to assert one. Registration does
-//! not consult that policy (it is upstream's funding-time policy, not the
-//! verification path), so the run still completes. That gap is reported, not hidden:
-//! see the `mint_url` note in `REPORT.md`.
+//! The payee is configured with the **test mint's actual URL** and holds a **receiver
+//! key** that the channel is addressed to. Both are load-bearing since registration
+//! started enforcing them: a body addressed to another key, or funded at another mint,
+//! is refused before anything is stored — because such a channel could be funded and
+//! then never settled. A placeholder mint here would only prove the refusal path.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,13 +130,12 @@ async fn wait_until_up(url: &str) {
     panic!("{url} never answered");
 }
 
-fn enabled_config(db_path: &str) -> SpilmanConfig {
+fn enabled_config(db_path: &str, mint_url: &str) -> SpilmanConfig {
     SpilmanConfig {
         enabled: true,
-        // Deliberately the *placeholder* mint, not the test mint's URL — see the
-        // module doc: this payee has no trusted-mint policy, and the test does not
-        // pretend it does.
-        mint_url: Some("https://mint.example".to_string()),
+        // The mint this payee will actually redeem against. Registration refuses a
+        // channel funded anywhere else, so a placeholder would only test the refusal.
+        mint_url: Some(mint_url.to_string()),
         in_bytes_per_millisat: 22_021,
         channel_db_path: Some(db_path.to_string()),
     }
@@ -189,14 +186,21 @@ async fn live_payee() -> LivePayee {
 
     // ── the payee, listening over HTTP ──────────────────────────────────────
     let dir = tempfile::tempdir().expect("tempdir");
+    // The key the channel will be addressed to — the same key the rail holds and
+    // `/spilman/params` advertises. Registration refuses any other.
+    let receiver_secret = SecretKey::generate();
     let cfg = Config {
-        spilman: enabled_config(&dir.path().join("spilman.db").to_string_lossy()),
+        spilman: enabled_config(
+            &dir.path().join("spilman.db").to_string_lossy(),
+            &mint_url,
+        ),
         ..Config::default()
     };
     let rail = Arc::new(
         SpilmanRail::from_config(&cfg.spilman)
             .expect("enabled config is not an error")
-            .expect("enabled config builds a rail"),
+            .expect("enabled config builds a rail")
+            .with_receiver_key(receiver_secret.clone()),
     );
     let router = create_router(app_state(cfg, Arc::clone(&rail)));
     let payee_port = ephemeral_port().await;
@@ -218,7 +222,6 @@ async fn live_payee() -> LivePayee {
 
     // ── open + fund a real channel ──────────────────────────────────────────
     let sender_secret = SecretKey::generate();
-    let receiver_secret = SecretKey::generate();
 
     let mut client_host =
         ConfigurableClientHost::open_sqlite(&dir.path().join("payer.sqlite").to_string_lossy())

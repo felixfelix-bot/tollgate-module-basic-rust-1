@@ -390,7 +390,20 @@ async fn close_authenticates_before_contacting_mint() {
 /// asking for the body and the id separately would produce two *different* channels
 /// and quietly assert nothing.
 fn registration() -> (crate::spilman::ChannelRegistrationRequest, String, String) {
-    let req = crate::spilman::registration::test_support::consistent_registration(64, None);
+    registration_for(&cashu::nuts::SecretKey::generate())
+}
+
+/// A registration addressed to `receiver` — the key a keyed rail will accept.
+///
+/// Registration refuses a channel addressed to a key the payee does not hold (and
+/// refuses outright when the payee holds none), so a test that expects a 200 must
+/// choose the key its rail was built with.
+fn registration_for(
+    receiver: &cashu::nuts::SecretKey,
+) -> (crate::spilman::ChannelRegistrationRequest, String, String) {
+    let req = crate::spilman::registration::test_support::consistent_registration_for(
+        receiver, 64, None,
+    );
     let body = serde_json::to_string(&req).expect("serialize registration");
     let channel_id = req.channel_id.clone();
     (req, body, channel_id)
@@ -404,8 +417,11 @@ fn registration() -> (crate::spilman::ChannelRegistrationRequest, String, String
 #[tokio::test]
 async fn registering_a_channel_makes_status_find_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (_req, body, channel_id) = registration();
+    // A keyed rail, because registration now refuses a channel addressed to any other
+    // key: a keyless fixture could only ever assert the refusal, not the acceptance.
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (_req, body, channel_id) = registration_for(&receiver);
 
     // Before: the channel does not exist, and the payee says so with a 404.
     let before = get(
@@ -456,8 +472,9 @@ async fn registering_a_channel_makes_status_find_it() {
 #[tokio::test]
 async fn a_duplicate_identical_registration_is_idempotent() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (_req, body, _channel_id) = registration();
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (_req, body, _channel_id) = registration_for(&receiver);
 
     let first = post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
     assert_eq!(first.0, StatusCode::OK, "first registration: {}", first.1);
@@ -487,8 +504,9 @@ async fn a_duplicate_identical_registration_is_idempotent() {
 #[tokio::test]
 async fn a_duplicate_with_different_data_is_refused_and_does_not_overwrite() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (original, original_body, channel_id) = registration();
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (original, original_body, channel_id) = registration_for(&receiver);
 
     let first = post_json_body(
         create_test_router(state.clone()),
@@ -552,15 +570,17 @@ async fn a_duplicate_with_different_data_is_refused_and_does_not_overwrite() {
 #[tokio::test]
 async fn a_malformed_registration_is_400_and_persists_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
 
     // A registration whose id its own params do not derive. The id is tracked so
     // the "nothing was persisted" assertion below names the *real* id that was
     // offered, not an unrelated one.
-    let (_, valid_body, valid_id) = registration();
+    let (_, valid_body, valid_id) = registration_for(&receiver);
     let unbound_id = "ab".repeat(32);
     let unbound_body = serde_json::to_string(
-        &crate::spilman::registration::test_support::consistent_registration(
+        &crate::spilman::registration::test_support::consistent_registration_for(
+            &receiver,
             64,
             Some(unbound_id.clone()),
         ),
@@ -610,9 +630,10 @@ async fn a_malformed_registration_is_400_and_persists_nothing() {
 #[tokio::test]
 async fn a_registration_in_an_unsupported_unit_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
 
-    let (mut req, _, _) = registration();
+    let (mut req, _, _) = registration_for(&receiver);
     req.params_json = req
         .params_json
         .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
@@ -630,5 +651,85 @@ async fn a_registration_in_an_unsupported_unit_is_refused() {
         code,
         StatusCode::BAD_REQUEST,
         "a non-sat channel must be refused at the door: {body}"
+    );
+}
+
+/// A payee that holds **no receiver key** must refuse a registration.
+///
+/// This was a documented carve-out ("cannot settle, cannot lose money") and that was
+/// wrong: by the time this body reaches the payee the funding is already committed in
+/// the channel at the mint, and only the channel's receiver key can release it. Accepting
+/// it therefore strands the payer's money with no error anywhere. Fail closed.
+///
+/// The refusal must be a 400 that *names* the reason, and it must persist nothing —
+/// otherwise a retry would find a channel the payee can never honour.
+#[tokio::test]
+async fn a_keyless_rail_refuses_registration_and_persists_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let (_req, body, channel_id) = registration_for(&receiver);
+
+    let (code, response) =
+        post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "a payee without a receiver key cannot settle, so it must not accept: {response}"
+    );
+    assert!(
+        response.contains("receiver key"),
+        "the refusal must say what is missing: {response}"
+    );
+
+    let rail = state.spilman.as_ref().expect("rail is enabled");
+    assert!(
+        rail.channel_funding(&channel_id)
+            .expect("read funding")
+            .is_none(),
+        "a refused registration must not leave a channel behind"
+    );
+}
+
+/// A channel funded at a mint this payee is **not configured for** must be refused.
+///
+/// The close swap is issued to `spilman.mint_url`, so a channel funded elsewhere can
+/// never be redeemed here: it would take the payer's funding and be unsettleable. The
+/// mint is trusted operator config, so this comparison is a real check — unlike the
+/// keyset id, which at registration time is only self-consistency (see
+/// `SpilmanRail::enforce_mint_binding`).
+#[tokio::test]
+async fn a_channel_funded_at_another_mint_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let req = crate::spilman::registration::test_support::consistent_registration_addressed_to(
+        &receiver,
+        "https://elsewhere.example",
+        64,
+        None,
+    );
+    let channel_id = req.channel_id.clone();
+    let body = serde_json::to_string(&req).expect("serialize");
+
+    let (code, response) =
+        post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "a channel funded at another mint must be refused: {response}"
+    );
+    assert!(
+        response.contains("https://elsewhere.example")
+            && response.contains("https://mint.example"),
+        "the refusal must name both the channel's mint and the configured one: {response}"
+    );
+
+    let rail = state.spilman.as_ref().expect("rail is enabled");
+    assert!(
+        rail.channel_funding(&channel_id)
+            .expect("read funding")
+            .is_none(),
+        "a refused registration must not leave a channel behind"
     );
 }

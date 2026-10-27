@@ -183,24 +183,32 @@ impl SpilmanRail {
     /// 409. That is the gap this refuses at the door instead of discovering at
     /// settlement time.
     ///
-    /// # The `None` case
+    /// # The `None` case — a keyless rail REFUSES
     ///
-    /// A rail with no receiver key cannot settle anything, so there is nothing to
-    /// compare against — this is the read-only / verification-only shape
-    /// (`LedgerPayeeHost::new`), and `receiver_key_is_acceptable` answers `false`
-    /// there. Production always installs a key (`main.rs` loads it from
-    /// `<config dir>/spilman-receiver.key`), so the check is live on every real
-    /// deployment.
+    /// A rail with no receiver key cannot settle anything, so accepting a registration
+    /// would take the payer's funded channel and strand it: the money is already in the
+    /// channel at the mint by the time this body arrives, and only *this* payee can
+    /// ever release it. There is no honest answer to "is this key yours?" without a
+    /// key, so the answer is a refusal, not a silent acceptance. (This used to be a
+    /// documented carve-out that accepted keyless registrations; that was wrong for
+    /// exactly the reason above.)
+    ///
+    /// Verification-only hosts still exist — `LedgerPayeeHost::new` answers `false` to
+    /// `receiver_key_is_acceptable` — but they are not allowed to *accept a channel*.
     fn enforce_receiver_binding(
         &self,
         record: &crate::spilman::ChannelFundingRecord,
     ) -> Result<(), SpilmanError> {
-        let Some(ours) = self.receiver_key.as_ref() else {
-            return Ok(());
-        };
         let refused = |detail: String| SpilmanError::InvalidRegistration {
             channel_id: record.channel_id.clone(),
             detail,
+        };
+        let Some(ours) = self.receiver_key.as_ref() else {
+            return Err(refused(
+                "this payee holds no receiver key and cannot settle a channel; \
+                 refusing the registration rather than stranding the funding"
+                    .to_string(),
+            ));
         };
         let params: serde_json::Value =
             serde_json::from_str(&record.params_json).map_err(|e| refused(e.to_string()))?;
@@ -216,6 +224,79 @@ impl SpilmanRail {
                  a channel for another key can never be settled here",
                 ours.public_key()
             )));
+        }
+        self.enforce_mint_binding(&params, record, refused)
+    }
+
+    /// Refuse a channel funded at a mint this payee is not configured for.
+    ///
+    /// # What is honestly checkable here, and what is not
+    ///
+    /// The **mint URL** is trusted: it comes from the operator's `config.json`
+    /// (`spilman.mint_url`), not from the payer. Comparing the channel's `mint` against
+    /// it is a real check, and it is the one that matters — the close swap is issued to
+    /// `self.mint_url`, so a channel funded elsewhere can never be redeemed here.
+    ///
+    /// The **keyset id** is *not* independently trusted at registration time: the only
+    /// keyset bytes in a registration body are supplied by the payer
+    /// (`keyset_info_json`). Comparing `params.keyset_id` against it proves the body is
+    /// self-consistent, which `validate_registration` already establishes, and nothing
+    /// more. The keyset becomes trusted only at close, where it is fetched from the
+    /// configured mint — that is where `mint_and_keyset_is_acceptable` does real work
+    /// (see `prepare_close` / `execute_close_with_network`, both of which build the host
+    /// with `for_close`).
+    ///
+    /// So this delegates to the host's own `mint_and_keyset_is_acceptable` with the
+    /// trusted mint and the body's keyset, and reports the two failures distinctly:
+    /// a mint mismatch is a policy refusal, a keyset inconsistency is a malformed body.
+    fn enforce_mint_binding<E>(
+        &self,
+        params: &serde_json::Value,
+        record: &crate::spilman::ChannelFundingRecord,
+        refused: E,
+    ) -> Result<(), SpilmanError>
+    where
+        E: Fn(String) -> SpilmanError,
+    {
+        let Some(configured) = self.mint_url.as_deref() else {
+            // No configured mint means this rail cannot redeem anything, and it cannot
+            // vouch for the channel's mint either. Same reasoning as the keyless case.
+            return Err(refused(
+                "no mint is configured for this payee; it cannot redeem a channel and \
+                 must not accept one"
+                    .to_string(),
+            ));
+        };
+        let claimed = params["mint"].as_str().ok_or_else(|| {
+            refused("channel params carry no mint URL".to_string())
+        })?;
+        let keyset_id = params["keyset_id"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no keyset_id".to_string()))?;
+        let keyset_id = keyset_id
+            .parse::<cashu::nuts::Id>()
+            .map_err(|e| refused(format!("keyset_id is not a keyset id: {e}")))?;
+        let key = self
+            .receiver_key
+            .as_ref()
+            .ok_or_else(|| refused("receiver key unavailable".to_string()))?;
+        let host = LedgerPayeeHost::for_close(
+            &self.ledger,
+            key,
+            configured,
+            &record.keyset_info_json,
+        );
+        if !cdk_spilman::SpilmanHost::mint_and_keyset_is_acceptable(&host, claimed, &keyset_id) {
+            if claimed != configured {
+                return Err(refused(format!(
+                    "channel was funded at {claimed} but this payee is configured for \
+                     {configured}; it could never redeem the channel"
+                )));
+            }
+            return Err(refused(
+                "channel keyset_id disagrees with the keyset info in the same body"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
