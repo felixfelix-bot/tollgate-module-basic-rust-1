@@ -168,3 +168,18 @@ working `record_payment`.
 - RED observed for every layer (see REPORT.md "Evidence"). — done.
 - Full gates green: 327/0 with `test-support,payer-driver`, 306/0 default, clippy 0 both,
   x86_64-musl build 0. — done.
+- Item 7 fixed as a money bug: keyless rail now REFUSES registration (400) instead of
+  accepting a channel it can never settle; `LedgerPayeeHost::new` still answers false on
+  the verification path. — done, mutation-verified.
+- Item 6: `enforce_mint_binding` calls `mint_and_keyset_is_acceptable` with the trusted
+  configured mint; honest about the keyset half being self-consistency only. — done,
+  mutation-verified.
+- Items 2-5: `scripts/spilman_receiver_binding_e2e.sh` + `~/reports/spilman_receiver_e2e.log`
+  — real module process, real restart (same key), mode 600 on ext4, exit 78 on a
+  read-only config dir, and a real `spilman-payer` process settling (close 200, not 409).
+  18/18 checks. — done.
+- Defect found, not fixed: fee-bearing close receipt (payer aborts after the mint already
+  moved the proofs; payer.rs:285 compares nominal receiver_sum to net balance). — reported.
+- Test-isolation flake in `src/cli/mod.rs` (env var set outside `env_guard`) fixed. — done.
+- Survivors: no physical router/aarch64, no real sats, E2E not in `cargo test`, key
+  rotation undocumented.

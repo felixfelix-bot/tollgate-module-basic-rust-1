@@ -241,3 +241,119 @@ Two, both recorded because they are the point of A8:
 A8 does not implement: a 405 for non-POST methods, converting axum's own
 body-limit rejection into a notice, or a live-mint verify/spend lane. All three
 are named rather than guessed at.
+
+---
+
+# Round 2 — the gaps the first report listed, closed or re-proven
+
+The first round closed the binding and said plainly what was unproven. This round
+attacks those items one by one. Two of them turned out to be code gaps, not just
+missing evidence.
+
+## Item 7 was a real money bug, not a carve-out
+
+The first report recorded "keyless rail still accepts registrations (documented
+carve-out; cannot settle, cannot lose money)". The second clause is false. By the time
+a registration body reaches the payee, the payer has already committed the funding in
+the channel **at the mint**; the only key that can ever release it is the channel's
+receiver key. A keyless payee that answers 200 therefore strands the payer's money
+with no error on any side.
+
+`SpilmanRail::register_channel` → `enforce_receiver_binding` now returns
+`InvalidRegistration` (HTTP 400) when `self.receiver_key` is `None`, naming the reason.
+`LedgerPayeeHost::new` still answers `false` to `receiver_key_is_acceptable` — a
+verification-only host is legitimate — but such a host may no longer *accept a channel*.
+
+Regression: `a_keyless_rail_refuses_registration_and_persists_nothing` (400, reason
+names the missing key, nothing persisted). Mutation-verified: restoring
+`return Ok(())` makes it fail.
+
+## Item 6: `mint_and_keyset_is_acceptable` now has a caller, honestly
+
+Upstream calls both host policies only from its own funding path
+(`cdk-spilman/src/bridge.rs:1648` and `:1663`, `validate_new_channel_funding`). This
+module has its own registration path, so both hooks were dead code here — unit-tested,
+never consulted.
+
+New `SpilmanRail::enforce_mint_binding`, called from `enforce_receiver_binding`, builds
+a host with the **trusted** configured mint (`spilman.mint_url` from operator config)
+and the body's keyset info, then asks `mint_and_keyset_is_acceptable`.
+
+What that honestly proves, stated so it is not overclaimed in the other direction:
+
+- **The mint URL is a real check.** It is compared against operator configuration, not
+  against payer-supplied bytes. A channel funded at another mint can never be redeemed
+  here (the close swap is issued to `self.mint_url`), so this must be refused at the
+  door.
+- **The keyset id is only self-consistency at registration.** The only keyset bytes in a
+  registration body come from the payer (`keyset_info_json`), and comparing
+  `params.keyset_id` to them is what `validate_registration` already does. The keyset
+  becomes trustworthy only at close, where it is fetched from the configured mint — that
+  is the point where `mint_and_keyset_is_acceptable` does real work.
+- No configured mint at all ⇒ refusal, for the same reason as the keyless case.
+
+Regression: `a_channel_funded_at_another_mint_is_refused` (400 naming both the channel's
+mint and the configured one, nothing persisted). Mutation-verified.
+
+## Items 2–5: real processes, not in-process harnesses
+
+`scripts/spilman_receiver_binding_e2e.sh` (added) builds the module binary, the
+`spilman-payer` example and the standalone `cdk-spilman-test-mintd`, then drives them
+as **separate OS processes** over loopback HTTP. Log:
+`~/reports/spilman_receiver_e2e.log`. 18 checks, 0 failed:
+
+| claim | observed |
+|---|---|
+| `/spilman/params` advertises a key | `receiver_pubkey=022adfa94fac96572179644fcde7a6aa5786096353b16297d9546a1476b320ca1a` |
+| key file on a real FS, owner-only | `stat -c %a` = **600**, 64 hex chars, dir on **ext4** (not tmpfs) |
+| survives a real restart | SIGTERM → new PID, new port → **identical** pubkey; key file sha256 unchanged (`fda8d1a3…`) |
+| unusable config dir fails loudly | exit **78** (EX_CONFIG), `Permission denied (os error 13)`, no key written |
+| real payer process settles | `PAYER_EXIT=0`, `PAYER_OPEN_OK channel_id=1483b090…`, `PAYER_PAYMENT_OK … balance=1 payee_credited=1`, `PAYER_SETTLED receiver_sum=1 sender_sum=127 total_value=128`; close returned **200, not 409** |
+
+This is item 3 (payer `main()` really executed) and item 4 (restart across a real exec)
+and item 5 (0600 on a non-tmpfs filesystem) — proven against the real binaries, not by a
+source-level assertion. It is still **not** a physical-router run: the router is aarch64
+and that toolchain is another agent's, so the 409 fix is measured on x86_64 with the
+real processes and a real mint daemon, not on the device.
+
+Re-run: `scripts/spilman_receiver_binding_e2e.sh` (self-contained; picks free ports,
+polls readiness, trap-kills only its own PIDs).
+
+## A defect this round found and did NOT paper over
+
+On a mint that charges an input fee (the test mint's default is 400 ppk), the close
+**succeeds at the mint** (`POST /spilman/close` → 200, proofs move) but the payer then
+aborts with `close receipt does not match signed settlement` and exits 1.
+`CloseSuccess.receiver_sum` carries the nominal pre-fee sum of the receiver outputs
+(2 for `balance=1` at 400 ppk) while `src/spilman/payer.rs:285` compares it against the
+net signed `payment.balance` (1).
+
+Reproduce: `MINT_FEE_PPK=400 scripts/spilman_receiver_binding_e2e.sh` (the script
+defaults to 0 and says why). This is **not** a receiver-binding failure and is **not**
+fixed here: fixing it means deciding what a fee-bearing receipt's receiver share *means*
+and comparing against the fee-adjusted net — a payer-side accounting change that would
+weaken or rewrite an assertion if done carelessly. Reported rather than tuned away.
+
+## Test-isolation flake fixed in passing
+
+`src/cli/mod.rs`'s test `Once` set `TOLLGATE_TEST_CONFIG_DIR` outside the shared
+`config::tests::env_guard()`, so it could land between
+`config::tests::config_dir_reports_correct_directory`'s `remove_var` and its assertion.
+Adding a third env-var-using suite exposed it. The `Once` body now takes the same guard
+every other env-var test uses.
+
+## Still unproven, precisely
+
+1. **No physical router, no aarch64, no real sats.** aarch64 belongs to another agent.
+   Settlement is proven against the in-process test mint (in-suite) and the standalone
+   test mint daemon (E2E) — real swap code, real sockets, fake wallet, zero value.
+2. **Fee-bearing close accounting is broken on the payer side** (above). The green E2E
+   run is fee-free; with fees the module settles and the payer reports failure after the
+   money moved.
+3. **`enforce_mint_binding`'s keyset half is not an independent trust check** at
+   registration time; the trusted keyset check happens at close.
+4. **Key rotation/backup is undocumented.** Losing `spilman-receiver.key` makes every
+   channel opened against it unsettleable — there is no recovery path and no warning at
+   startup beyond the file being created once.
+5. **The E2E script is not part of `cargo test`.** It is a separate, self-contained
+   script; nothing in CI would run it.
