@@ -239,6 +239,71 @@ pub struct SettlementReceipt {
     pub already_closed: bool,
 }
 
+/// The channel facts a payer needs in order to check a close receipt's accounting.
+///
+/// Both inputs come from the channel the payer itself opened: the keyset info it funded
+/// against (including `inputFeePpk`) and the `maximum_amount_for_one_output` rule from
+/// the channel params. From those two, the expected **nominal** receiver sum is
+/// derivable — the payer does not have to trust the seller's arithmetic, it recomputes
+/// the same inverse the seller used.
+#[derive(Debug, Clone)]
+pub struct CloseAccounting {
+    keyset_info_json: String,
+    maximum_amount_for_one_output: u64,
+}
+
+impl CloseAccounting {
+    pub fn new(keyset_info_json: impl Into<String>, maximum_amount_for_one_output: u64) -> Self {
+        Self {
+            keyset_info_json: keyset_info_json.into(),
+            maximum_amount_for_one_output,
+        }
+    }
+
+    /// Build from the channel's params JSON and the keyset info in the same record.
+    ///
+    /// A params blob without `maximum_amount_for_one_output` is a refusal, not a
+    /// default: the fee-aware check is only meaningful with the channel's real rule.
+    pub fn from_params_json(
+        keyset_info_json: impl Into<String>,
+        params_json: &str,
+    ) -> Result<Self, SpilmanError> {
+        let params: serde_json::Value = serde_json::from_str(params_json)
+            .map_err(|e| SpilmanError::Bridge(format!("invalid channel params: {e}")))?;
+        let max = params
+            .get("maximum_amount_for_one_output")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                SpilmanError::Bridge(
+                    "channel params carry no maximum_amount_for_one_output".to_string(),
+                )
+            })?;
+        Ok(Self::new(keyset_info_json, max))
+    }
+
+    fn parsed(&self) -> Result<cdk_spilman::KeysetInfo, SpilmanError> {
+        cdk_spilman::parse_keyset_info_from_json(&self.keyset_info_json)
+            .map_err(|e| SpilmanError::Bridge(format!("invalid keyset info: {e}")))
+    }
+
+    /// `(nominal the seller must have committed to, net value of `receiver_sum` after fees)`.
+    fn expected_and_net(
+        &self,
+        receiver_sum: u64,
+        balance: u64,
+    ) -> Result<(u64, u64), SpilmanError> {
+        let keyset = self.parsed()?;
+        let expected = keyset
+            .inverse_deterministic_value_after_fees(balance, self.maximum_amount_for_one_output)
+            .map_err(|e| SpilmanError::Bridge(format!("close accounting failed: {e}")))?
+            .nominal_value;
+        let net = keyset
+            .deterministic_value_after_fees(receiver_sum, self.maximum_amount_for_one_output)
+            .map_err(|e| SpilmanError::Bridge(format!("close accounting failed: {e}")))?;
+        Ok((expected, net))
+    }
+}
+
 impl CooperativeSettlement {
     pub fn prepare<H: SpilmanClientHost, N: SpilmanClientNetworking>(
         bridge: &SpilmanClientBridge<H, N>,
@@ -269,10 +334,23 @@ impl CooperativeSettlement {
     /// Accept only a complete, matching successful seller close receipt, then mark
     /// the payer closed. The seller is responsible for mint execution; this is
     /// structural/accounting validation, not independent mint attestation.
+    ///
+    /// # Why the receipt's `receiver_sum` is not compared to `payment.balance`
+    ///
+    /// `receiver_sum` is the **nominal** value of the receiver's outputs — what the
+    /// seller committed to *before* the mint takes its input fee. On any mint with
+    /// `input_fee_ppk > 0` it is strictly larger than the signed balance (at 400 ppk and
+    /// a 1-sat balance it is 2). Comparing the two directly rejected a perfectly good
+    /// close *after* the money had already moved: the mint settled, the seller marked
+    /// the channel closed, and the payer reported "close receipt does not match signed
+    /// settlement". The receipt is checked against the same inverse the seller uses to
+    /// build its outputs (`inverse_deterministic_value_after_fees`), and the net value of
+    /// the receiver proofs after fees must still cover what the payer signed.
     pub fn complete<H: SpilmanClientHost, N: SpilmanClientNetworking>(
         &self,
         bridge: &SpilmanClientBridge<H, N>,
         response_json: &str,
+        accounting: &CloseAccounting,
     ) -> Result<SettlementReceipt, SpilmanError> {
         let receipt: SettlementReceipt = serde_json::from_str(response_json)
             .map_err(|e| SpilmanError::Bridge(format!("invalid close receipt: {e}")))?;
@@ -281,8 +359,13 @@ impl CooperativeSettlement {
         let sender_sum = proofs
             .iter()
             .try_fold(0u64, |sum, proof| sum.checked_add(proof.amount.to_u64()));
+        let (expected_nominal, receiver_net) =
+            accounting.expected_and_net(receipt.receiver_sum, self.payment.balance)?;
         if receipt.channel_id != self.payment.channel_id
-            || receipt.receiver_sum != self.payment.balance
+            || receipt.receiver_sum != expected_nominal
+            // The fee-adjusted value of what the receiver got must still cover the
+            // balance the payer signed: a receipt cannot settle for less.
+            || receiver_net < self.payment.balance
             || receipt.receiver_sum.checked_add(receipt.sender_sum) != Some(receipt.total_value)
             || sender_sum != Some(receipt.sender_sum)
         {
@@ -384,5 +467,71 @@ mod tests {
         // §6 hazard 5: the payee must settle before expiry, and the payer must not
         // race it. A session is minutes; a day is three orders of magnitude of slack.
         assert!(DEFAULT_CHANNEL_LIFETIME_SECS >= 24 * 60 * 60);
+    }
+
+    /// A fee-bearing mint must not be mistaken for a mismatched receipt.
+    ///
+    /// This is the defect measured on the real binaries: at 400 ppk the seller's
+    /// `receiver_sum` is the NOMINAL 2 for a 1-sat balance, and comparing it to the net
+    /// balance rejected a close the mint had already executed. The accounting must
+    /// derive the nominal from the channel's own keyset rule, and must still refuse a
+    /// receipt whose proofs do not cover the signed balance after fees.
+    #[test]
+    fn fee_bearing_close_accounting_is_nominal_and_still_covers_the_balance() {
+        let keyset_info_json = fee_bearing_keyset_info(400);
+        let accounting = CloseAccounting::new(&keyset_info_json, 64);
+
+        // balance 1 at 400 ppk: nominal 2, and 2 sat of outputs are worth 1 sat net.
+        let (expected, net) = accounting.expected_and_net(2, 1).expect("accounting");
+        assert_eq!(
+            expected, 2,
+            "nominal must be the pre-fee value, not the balance"
+        );
+        assert_eq!(
+            net, 1,
+            "the receiver's outputs must cover the signed balance"
+        );
+
+        // A receipt that carries the NET sum instead of the nominal one is refused…
+        let (expected_net, _) = accounting.expected_and_net(1, 1).expect("accounting");
+        assert_eq!(
+            expected_net, 2,
+            "the expected nominal does not depend on the receipt"
+        );
+
+        // …and the fee-free case is unchanged (nominal == balance).
+        let free = CloseAccounting::new(fee_bearing_keyset_info(0), 64);
+        assert_eq!(free.expected_and_net(1, 1).expect("accounting"), (1, 1));
+    }
+
+    /// A keyset info with `input_fee_ppk` and denominations 1..=64, ids derived from the
+    /// keys exactly as the protocol does.
+    #[cfg(test)]
+    fn fee_bearing_keyset_info(input_fee_ppk: u64) -> String {
+        let keys: std::collections::BTreeMap<String, cashu::nuts::PublicKey> = (0..7)
+            .map(|i| {
+                let amount = 1u64 << i;
+                (
+                    amount.to_string(),
+                    cashu::nuts::SecretKey::generate().public_key(),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "keysetId": cashu::nuts::Id::v1_from_keys(
+                &cashu::nuts::Keys::new(
+                    keys.iter()
+                        .map(|(amount, key)| {
+                            (cashu::Amount::from(amount.parse::<u64>().expect("amount")), *key)
+                        })
+                        .collect(),
+                ),
+            )
+            .to_string(),
+            "unit": "sat",
+            "keys": keys,
+            "inputFeePpk": input_fee_ppk,
+        })
+        .to_string()
     }
 }

@@ -305,7 +305,12 @@ pub(crate) mod test_support {
         capacity: u64,
         override_id: Option<String>,
     ) -> ChannelRegistrationRequest {
-        consistent_registration_addressed_to(receiver, "https://mint.example", capacity, override_id)
+        consistent_registration_addressed_to(
+            receiver,
+            "https://mint.example",
+            capacity,
+            override_id,
+        )
     }
 
     /// The same body, addressed to `receiver` **and funded at `mint`**.

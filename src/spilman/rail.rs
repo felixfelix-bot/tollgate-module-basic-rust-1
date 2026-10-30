@@ -267,9 +267,9 @@ impl SpilmanRail {
                     .to_string(),
             ));
         };
-        let claimed = params["mint"].as_str().ok_or_else(|| {
-            refused("channel params carry no mint URL".to_string())
-        })?;
+        let claimed = params["mint"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no mint URL".to_string()))?;
         let keyset_id = params["keyset_id"]
             .as_str()
             .ok_or_else(|| refused("channel params carry no keyset_id".to_string()))?;
@@ -280,12 +280,8 @@ impl SpilmanRail {
             .receiver_key
             .as_ref()
             .ok_or_else(|| refused("receiver key unavailable".to_string()))?;
-        let host = LedgerPayeeHost::for_close(
-            &self.ledger,
-            key,
-            configured,
-            &record.keyset_info_json,
-        );
+        let host =
+            LedgerPayeeHost::for_close(&self.ledger, key, configured, &record.keyset_info_json);
         if !cdk_spilman::SpilmanHost::mint_and_keyset_is_acceptable(&host, claimed, &keyset_id) {
             if claimed != configured {
                 return Err(refused(format!(
@@ -294,8 +290,7 @@ impl SpilmanRail {
                 )));
             }
             return Err(refused(
-                "channel keyset_id disagrees with the keyset info in the same body"
-                    .to_string(),
+                "channel keyset_id disagrees with the keyset info in the same body".to_string(),
             ));
         }
         Ok(())
@@ -354,7 +349,8 @@ impl SpilmanRail {
         balance: u64,
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
-        self.ledger.record_payment_unverified(channel_id, balance, signature)
+        self.ledger
+            .record_payment_unverified(channel_id, balance, signature)
     }
 }
 
@@ -379,44 +375,69 @@ impl SpilmanRail {
     /// Authenticate before any mint I/O; return only the sender's durable receipt.
     /// `None` means authorized, but completion has not yet been persisted.
     pub fn authenticated_close_receipt(
-        &self, payment: &cdk_spilman::Payment,
+        &self,
+        payment: &cdk_spilman::Payment,
     ) -> Result<Option<cdk_spilman::CloseSuccess>, SpilmanError> {
         let id = &payment.channel_id;
-        let funding = self.ledger.get_channel_funding(id)?
+        let funding = self
+            .ledger
+            .get_channel_funding(id)?
             .ok_or_else(|| close_error("unknown channel"))?;
-        let params: serde_json::Value = serde_json::from_str(&funding.params_json).map_err(close_error)?;
+        let params: serde_json::Value =
+            serde_json::from_str(&funding.params_json).map_err(close_error)?;
         if params["mint"].as_str() != self.mint_url.as_deref() {
             return Err(close_error("channel mint does not match configured mint"));
         }
         let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
-            .map_err(close_error)?.try_into().map_err(close_error)?;
+            .map_err(close_error)?
+            .try_into()
+            .map_err(close_error)?;
         let parameters = cdk_spilman::ChannelParameters::from_json_with_channel_secret(
             &funding.params_json,
-            cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json).map_err(close_error)?,
-            secret).map_err(close_error)?;
-        let channel = cdk_spilman::EstablishedChannel::new(parameters,
-            serde_json::from_str(&funding.funding_proofs_json).map_err(close_error)?)
-            .map_err(close_error)?;
+            cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json)
+                .map_err(close_error)?,
+            secret,
+        )
+        .map_err(close_error)?;
+        let channel = cdk_spilman::EstablishedChannel::new(
+            parameters,
+            serde_json::from_str(&funding.funding_proofs_json).map_err(close_error)?,
+        )
+        .map_err(close_error)?;
         cdk_spilman::BalanceUpdateMessage {
-            channel_id: id.clone(), amount: payment.balance,
+            channel_id: id.clone(),
+            amount: payment.balance,
             signature: payment.signature.parse().map_err(close_error)?,
-        }.verify_sender_signature(&channel).map_err(close_error)?;
-        let latest = self.ledger.get_latest_payment(id)?
+        }
+        .verify_sender_signature(&channel)
+        .map_err(close_error)?;
+        let latest = self
+            .ledger
+            .get_latest_payment(id)?
             .ok_or_else(|| close_error("missing accepted payment"))?;
         if latest.balance != payment.balance || latest.signature != payment.signature {
-            return Err(close_error("close authorization does not match accepted payment"));
+            return Err(close_error(
+                "close authorization does not match accepted payment",
+            ));
         }
-        let Some((_, state, completed)) = self.ledger.close_journal(id)? else { return Ok(None); };
-        if state != "closed" { return Ok(None); }
+        let Some((_, state, completed)) = self.ledger.close_journal(id)? else {
+            return Ok(None);
+        };
+        if state != "closed" {
+            return Ok(None);
+        }
         let completed: cdk_spilman::CompletedClose = serde_json::from_str(
-            &completed.ok_or_else(|| close_error("closed journal missing completion"))?
-        ).map_err(close_error)?;
+            &completed.ok_or_else(|| close_error("closed journal missing completion"))?,
+        )
+        .map_err(close_error)?;
         if completed.channel_id != *id || completed.balance != payment.balance {
             return Err(close_error("completion binding mismatch"));
         }
         Ok(Some(cdk_spilman::CloseSuccess {
             channel_id: id.clone(),
-            total_value: completed.receiver_sum.checked_add(completed.sender_sum)
+            total_value: completed
+                .receiver_sum
+                .checked_add(completed.sender_sum)
                 .ok_or_else(|| close_error("completion value overflow"))?,
             receiver_sum: completed.receiver_sum,
             sender_sum: completed.sender_sum,
@@ -670,6 +691,7 @@ impl PaymentRail for SpilmanRail {
         //    because authenticity and "not a replay" are different questions: a
         //    re-sent valid signature verifies perfectly and must still not be credited
         //    twice.
-        self.ledger.record_payment_unverified(channel_id, balance, signature)
+        self.ledger
+            .record_payment_unverified(channel_id, balance, signature)
     }
 }

@@ -704,7 +704,9 @@ async fn main() {
         Ok(response) => response,
         Err(e) => fail("POST /spilman/close", &e),
     };
-    let receipt = match settlement.complete(&client, &response) {
+    // The channel's own keyset rule (the same 64 passed to `ChannelOpening::prepare`).
+    let accounting = payer::CloseAccounting::new(&keyset_info_json, 64);
+    let receipt = match settlement.complete(&client, &response, &accounting) {
         Ok(receipt) => receipt,
         Err(e) => fail("verify cooperative close", &e),
     };
@@ -776,7 +778,10 @@ mod tests {
             production.contains("let sender_secret = SecretKey::generate();"),
             "the single ephemeral key must be the sender's"
         );
-        for site in ["&receiver_pubkey,", "with_channel_secret(&sender_secret, &receiver_pubkey)"] {
+        for site in [
+            "&receiver_pubkey,",
+            "with_channel_secret(&sender_secret, &receiver_pubkey)",
+        ] {
             assert!(
                 production.contains(site),
                 "the open and the registration must both use the advertised key ({site} \

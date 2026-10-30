@@ -190,10 +190,7 @@ async fn live_payee() -> LivePayee {
     // `/spilman/params` advertises. Registration refuses any other.
     let receiver_secret = SecretKey::generate();
     let cfg = Config {
-        spilman: enabled_config(
-            &dir.path().join("spilman.db").to_string_lossy(),
-            &mint_url,
-        ),
+        spilman: enabled_config(&dir.path().join("spilman.db").to_string_lossy(), &mint_url),
         ..Config::default()
     };
     let rail = Arc::new(

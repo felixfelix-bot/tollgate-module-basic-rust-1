@@ -289,6 +289,9 @@ async fn payer_cooperative_settle_validates_receipt_and_ownership() {
         payer::CooperativeSettlement::prepare(&attacker, &channel_id, latest.balance).is_err(),
         "a stored channel without its sender key must not authorize close"
     );
+    // The channel's own accounting rule, so the payer can recompute the nominal
+    // receiver sum the seller had to commit to (64 matches the `prepare` call above).
+    let close_accounting = payer::CloseAccounting::new(&keyset_info_json, 64);
     let settlement =
         payer::CooperativeSettlement::prepare(&client_bridge, &channel_id, latest.balance)
             .expect("prepare settlement");
@@ -298,12 +301,17 @@ async fn payer_cooperative_settle_validates_receipt_and_ownership() {
         ClientChannelState::Open
     );
     assert!(settlement
-        .complete(&client_bridge, r#"{"channel_id":"other"}"#)
+        .complete(
+            &client_bridge,
+            r#"{"channel_id":"other"}"#,
+            &close_accounting
+        )
         .is_err());
     assert!(settlement
         .complete(
             &client_bridge,
-            &serde_json::json!({"channel_id":channel_id}).to_string()
+            &serde_json::json!({"channel_id":channel_id}).to_string(),
+            &close_accounting,
         )
         .is_err());
     assert_eq!(
@@ -335,19 +343,19 @@ async fn payer_cooperative_settle_validates_receipt_and_ownership() {
     let mut wrong: serde_json::Value = serde_json::from_str(&receipt).unwrap();
     wrong["channel_id"] = "other".into();
     assert!(settlement
-        .complete(&client_bridge, &wrong.to_string())
+        .complete(&client_bridge, &wrong.to_string(), &close_accounting)
         .is_err());
     wrong = serde_json::from_str(&receipt).unwrap();
     wrong["sender_sum"] = 9999.into();
     assert!(settlement
-        .complete(&client_bridge, &wrong.to_string())
+        .complete(&client_bridge, &wrong.to_string(), &close_accounting)
         .is_err());
     assert_eq!(
         client_bridge.get_channel_info(&channel_id).unwrap().state,
         ClientChannelState::Open
     );
     let verified = settlement
-        .complete(&client_bridge, &receipt)
+        .complete(&client_bridge, &receipt, &close_accounting)
         .expect("complete actual close");
     assert_eq!(verified.receiver_sum, STEPS);
     assert_eq!(

@@ -268,8 +268,14 @@ async fn close_http_settles_and_replays_only_authenticated_sender_receipt() {
         409
     );
     assert!(live.rail.close_status(&live.channel_id).is_err());
-    let settlement = payer::CooperativeSettlement::from_accepted_payment(&live.bridge, &payment).unwrap();
-    let response = http.post(&url).json(settlement.payment()).send().await.unwrap();
+    let settlement =
+        payer::CooperativeSettlement::from_accepted_payment(&live.bridge, &payment).unwrap();
+    let response = http
+        .post(&url)
+        .json(settlement.payment())
+        .send()
+        .await
+        .unwrap();
     let status = response.status();
     let body = response.text().await.unwrap();
     assert!(status.is_success(), "{status}: {body}");
@@ -277,7 +283,16 @@ async fn close_http_settles_and_replays_only_authenticated_sender_receipt() {
         !body.contains("receiver_proofs"),
         "receiver bearer proofs leaked"
     );
-    settlement.complete(&live.bridge, &body).expect("payer settled");
+    // Recompute the nominal receiver sum from the channel's own keyset rule, so the
+    // receipt is checked against what the seller actually had to commit to.
+    let accounting = payer::CloseAccounting::from_params_json(
+        &live.registration.keyset_info_json,
+        &live.registration.params_json,
+    )
+    .expect("channel accounting");
+    settlement
+        .complete(&live.bridge, &body, &accounting)
+        .expect("payer settled");
     println!("BEFORE: open balance=3; AFTER: seller closed receiver_sum=3, payer closed");
     let receipt: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(receipt["receiver_sum"], 3);

@@ -320,8 +320,15 @@ async fn a_channel_opened_against_the_advertised_key_settles_over_http() {
 
     // The payer's own verification: it unblinds the receipt against the proofs it
     // funded, so this cannot pass on a fabricated body.
+    // Fee-aware: the receipt carries the NOMINAL receiver sum, so the payer checks it
+    // against the channel's own keyset rule rather than against the net balance.
+    let accounting = payer::CloseAccounting::from_params_json(
+        &live.registration.keyset_info_json,
+        &live.registration.params_json,
+    )
+    .expect("channel accounting");
     let receipt = settlement
-        .complete(&live.bridge, &body)
+        .complete(&live.bridge, &body, &accounting)
         .expect("the payer must be able to verify the close receipt");
     assert_eq!(
         receipt.receiver_sum + receipt.sender_sum,
@@ -378,10 +385,9 @@ async fn a_channel_for_a_foreign_receiver_key_is_refused_at_registration() {
         Some(0),
         "a refused registration must leave no record: {status}"
     );
-    assert!(
-        live.rail
-            .channel_funding(&channel_id)
-            .expect("read funding")
-            .is_none()
-    );
+    assert!(live
+        .rail
+        .channel_funding(&channel_id)
+        .expect("read funding")
+        .is_none());
 }

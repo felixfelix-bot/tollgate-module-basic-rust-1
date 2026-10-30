@@ -299,3 +299,47 @@ The one test that needs it is itself `#[cfg(feature = "test-support")]`, so the
    `src/spilman/billing.rs` and pinned by tests; the disagreement is checkable.
 4. **`record_payment` ordering** — verification must precede the durable write, and
    the write must stay CAS against the exact previous balance.
+
+## 7. The receiver key: backup, rotation, and what a lost key costs
+
+The payee holds one persisted key, `<config dir>/spilman-receiver.key`
+(`/etc/tollgate/spilman-receiver.key` on a router). It is 32 bytes of hex, created once
+with mode `0600`, and reloaded on every boot. It is **not** the merchant (Nostr)
+identity: the compressed key shares its x-coordinate with the x-only npub, so publishing
+it on `/spilman/params` would link the router's identity to its rail.
+
+### Why it must be backed up
+
+Every channel opened against that key can only be released by a close signed with it. The
+module refuses to boot (exit `78`, `EX_CONFIG`) if the file is missing and cannot be
+created, and refuses to *regenerate* a corrupt file. There is no recovery path from a lost
+key: the funding stays in the channels at the mint. Back the file up wherever you back up
+`identities.json` — same directory, same handling.
+
+```sh
+install -m 600 /etc/tollgate/spilman-receiver.key /root/backup/spilman-receiver.key
+```
+
+### Rotation
+
+There is no in-place rotation, and that is deliberate: advertising a new key while
+channels opened against the old one are still open makes those channels unsettleable.
+
+To rotate:
+
+1. Let every open channel close (or write it off; the money is gone either way).
+2. Stop the module.
+3. Replace the file with 32 hex characters of a fresh key (`head -c 32 /dev/urandom |
+   xxd -p -c 64 > /etc/tollgate/spilman-receiver.key`, then `chmod 600`).
+4. Start the module and confirm the new advertisement:
+   `curl -s localhost:2121/spilman/params | jq -r .receiver_pubkey`.
+
+Payers read `/spilman/params` at open time, so a rotating payee is self-describing as
+long as it is not carrying live channels across the change. Keep the old key file until
+you are sure no channel opened against it remains.
+
+### What is not implemented
+
+No `spilman-receiver-key rotate` command, no multi-key ("current + previous") acceptance,
+and no warning at startup that the key exists but no channel ledger does. Those are
+tracked in `REPORT.md`, not silently assumed.

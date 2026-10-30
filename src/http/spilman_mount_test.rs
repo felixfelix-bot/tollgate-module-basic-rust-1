@@ -37,7 +37,10 @@ fn state_enabled(dir: &std::path::Path) -> AppState {
 
 /// An enabled rail that **holds a receiver key**, which is what a production
 /// payee always has (`main.rs`) and what `/spilman/params` must advertise.
-fn state_enabled_with_receiver(dir: &std::path::Path, receiver: &cashu::nuts::SecretKey) -> AppState {
+fn state_enabled_with_receiver(
+    dir: &std::path::Path,
+    receiver: &cashu::nuts::SecretKey,
+) -> AppState {
     state_with_spilman(dir, Some(receiver))
 }
 
@@ -214,9 +217,9 @@ async fn spilman_paths_respond_when_enabled() {
 /// every unit test stayed green.
 #[tokio::test]
 async fn params_advertises_the_receiver_key_the_payee_accepts() {
+    use crate::spilman::LedgerPayeeHost;
     use axum::body::Body;
     use axum::http::Request;
-    use crate::spilman::LedgerPayeeHost;
     use cdk_spilman::SpilmanHost;
     use std::sync::Arc as StdArc;
     use tower::ServiceExt;
@@ -401,9 +404,8 @@ fn registration() -> (crate::spilman::ChannelRegistrationRequest, String, String
 fn registration_for(
     receiver: &cashu::nuts::SecretKey,
 ) -> (crate::spilman::ChannelRegistrationRequest, String, String) {
-    let req = crate::spilman::registration::test_support::consistent_registration_for(
-        receiver, 64, None,
-    );
+    let req =
+        crate::spilman::registration::test_support::consistent_registration_for(receiver, 64, None);
     let body = serde_json::to_string(&req).expect("serialize registration");
     let channel_id = req.channel_id.clone();
     (req, body, channel_id)
@@ -720,8 +722,7 @@ async fn a_channel_funded_at_another_mint_is_refused() {
         "a channel funded at another mint must be refused: {response}"
     );
     assert!(
-        response.contains("https://elsewhere.example")
-            && response.contains("https://mint.example"),
+        response.contains("https://elsewhere.example") && response.contains("https://mint.example"),
         "the refusal must name both the channel's mint and the configured one: {response}"
     );
 

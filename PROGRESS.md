@@ -183,3 +183,21 @@ working `record_payment`.
 - Test-isolation flake in `src/cli/mod.rs` (env var set outside `env_guard`) fixed. — done.
 - Survivors: no physical router/aarch64, no real sats, E2E not in `cargo test`, key
   rotation undocumented.
+- Item 1 FIXED: fee-bearing close receipts. RED observed first with MINT_FEE_PPK=400
+  (module closed, payer aborted `close receipt does not match signed settlement`).
+  Cause: upstream `receiver_sum` is the NOMINAL sum (bridge.rs:1085
+  inverse_deterministic_value_after_fees(balance).nominal_value), we compared it to the
+  NET signed balance. Fix: `CloseAccounting` in payer.rs; `complete()` now checks the
+  nominal AND that the fee-adjusted net still covers the signed balance. GREEN: 18/18
+  E2E checks at 400 ppk, PAYER_SETTLED receiver_sum=2 sender_sum=122 total=124. — done.
+- Item 2a PROVEN: settlement against a PUBLIC third-party mint (testnut.cashu.space),
+  real HTTP/keysets/fees: PAYER_EXIT=0, PAYER_SETTLED receiver_sum=2 sender_sum=124
+  total=126. New scripts/spilman_public_mint_probe.sh. — done.
+- Item 2b aarch64 musl build works (aarch64-linux-gnu-gcc linker, exit 0, ELF aarch64).
+  Router itself unreachable (no route to host) so no device run exists to report.
+- Item 3 DOCUMENTED: docs/spilman-channel-rail.md §7 backup/rotation/lost-key cost.
+- Item 4 WIRED: tests/spilman_process_e2e.rs invokes the E2E script from cargo test
+  (payer-driver feature, #[ignore]); 1 passed in 143s standalone.
+- E2E script default target dir moved to the worktree target + explicit ~2 GiB free-space
+  precondition; the scratch dir caused an ENOSPC that read as a test failure. — done.
+- Clippy -D warnings green both ways after the CloseAccounting change (needless-borrow).

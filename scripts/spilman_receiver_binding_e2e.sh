@@ -39,7 +39,9 @@
 #   nominal=2 vs net=1, so the payer reports "close receipt does not match signed
 #   settlement" and exits 1 AFTER the money moved. Set MINT_FEE_PPK=400 to reproduce
 #   that defect; the default here is 0 so check 5 measures the binding, not the
-#   fee-accounting gap (which is tracked separately and is NOT fixed by this script).
+#   fee-accounting gap. THIS IS NOW FIXED in src/spilman/payer.rs (the receipt check is
+#   fee-aware), so the default here is 400 — the mint's own default — because a fee-free
+#   mint is the unrepresentative case. MINT_FEE_PPK=0 still works.
 #
 # Exit: 0 = all checks passed, 1 = at least one check failed.
 
@@ -49,9 +51,15 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORTS="${REPORTS:-$HOME/reports}"
 LOG="${E2E_LOG:-$REPORTS/spilman_receiver_e2e.log}"
 
-# A SEPARATE target dir: the worktree's target/ is contended by concurrent builds
-# elsewhere, and a binary that vanishes mid-proof proves nothing.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.hermes/profiles/manager/cache/scratch/e2e-target}"
+# Reuse the worktree's own target/ by default.
+#
+# It used to default to a directory under the manager cache. That looked tidier and was
+# worse in both directions: it recompiled the whole cdk tree (~3 GB of rlibs) on every
+# run, and it is not a directory anyone has sized for that, so a full run died with
+# "No space left on device (os error 28)" and reported it as a *test* failure. Sharing
+# the worktree target means the binaries are already built, and the disk-space
+# precondition below refuses early with a clear message when there genuinely is no room.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
 MODULE_BIN="${MODULE_BIN:-$CARGO_TARGET_DIR/debug/tollgate-module-basic-rust}"
 PAYER_BIN="${PAYER_BIN:-$CARGO_TARGET_DIR/debug/examples/spilman-payer}"
 MINTD_BIN="${MINTD_BIN:-$CARGO_TARGET_DIR/debug/cdk-spilman-test-mintd}"
@@ -59,7 +67,7 @@ CHECKOUT="${SPILMAN_CHECKOUT:-$HOME/.cargo/git/checkouts/cashu_spilman_channels-
 E2E_BUILD="${E2E_BUILD:-1}"
 # See "THE MINT'S INPUT FEE" above. 0 = prove the binding; 400 = reproduce the
 # fee-accounting defect in the payer's receipt check.
-MINT_FEE_PPK="${MINT_FEE_PPK:-0}"
+MINT_FEE_PPK="${MINT_FEE_PPK:-400}"
 
 mkdir -p "$REPORTS"
 # Everything this script says goes to the console AND to the log file.
@@ -67,6 +75,15 @@ exec > >(tee "$LOG") 2>&1
 echo "# spilman_receiver_binding_e2e.sh — $(date -Is)"
 echo "# repo=$REPO"
 echo "# target=$CARGO_TARGET_DIR"
+
+# Fail fast and legibly. Building this tree needs a couple of GB of headroom; discovering
+# that halfway through a build reads as a protocol failure in the log, which it is not.
+AVAIL_KB="$(df -Pk "$CARGO_TARGET_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 2000000 ]; then
+    echo "FAIL: only $((AVAIL_KB / 1024)) MiB free on the target filesystem; need ~2 GiB"
+    echo "      free space or set CARGO_TARGET_DIR to one that has it"
+    exit 1
+fi
 
 FAILURES=0
 CHECKS=0
@@ -412,9 +429,10 @@ elif grep -qiE '409|close authorization refused|POST /spilman/close' "$PAYER_LOG
     echo "--- module log tail ---"; tail -20 "$MOD2_LOG" || true
 elif grep -q 'close receipt does not match signed settlement' "$PAYER_LOG"; then
     fail "check-5 the mint closed the channel (HTTP 200) but the payer rejected the receipt:"
-    echo "        receipt.receiver_sum was nominal, payment.balance is net — the fee-aware"
-    echo "        receipt check is not in this script's scope to fix. Re-run with"
-    echo "        MINT_FEE_PPK=0 to measure the receiver binding on a fee-free mint."
+    echo "        this is the fee-bearing receipt regression: receipt.receiver_sum is the"
+    echo "        NOMINAL sum, and the payer must check it against the channel's own"
+    echo "        inverse_deterministic_value_after_fees(balance) — not against the net"
+    echo "        balance. If this fires, that check in src/spilman/payer.rs regressed."
 else
     fail "check-5 no PAYER_SETTLED marker; close not proven"
 fi
