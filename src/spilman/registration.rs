@@ -291,8 +291,41 @@ pub(crate) mod test_support {
         capacity: u64,
         override_id: Option<String>,
     ) -> ChannelRegistrationRequest {
+        consistent_registration_for(&SecretKey::generate(), capacity, override_id)
+    }
+
+    /// The same body, addressed to a **caller-chosen** receiver key.
+    ///
+    /// Needed because registration now *refuses* a channel addressed to a key the payee
+    /// does not hold: a fixture that generated its own receiver could only ever build a
+    /// body the payee must reject. Tests that expect acceptance must therefore choose the
+    /// key the rail holds.
+    pub fn consistent_registration_for(
+        receiver: &SecretKey,
+        capacity: u64,
+        override_id: Option<String>,
+    ) -> ChannelRegistrationRequest {
+        consistent_registration_addressed_to(
+            receiver,
+            "https://mint.example",
+            capacity,
+            override_id,
+        )
+    }
+
+    /// The same body, addressed to `receiver` **and funded at `mint`**.
+    ///
+    /// `mint` is part of the channel id's derivation, so a test that changes it must
+    /// rebuild the body rather than string-patch it — otherwise the id no longer binds
+    /// and the refusal under test is replaced by "id does not bind to the params".
+    pub fn consistent_registration_addressed_to(
+        receiver: &SecretKey,
+        mint: &str,
+        capacity: u64,
+        override_id: Option<String>,
+    ) -> ChannelRegistrationRequest {
         let sender = SecretKey::generate();
-        let receiver = SecretKey::generate();
+        let receiver = receiver.clone();
         let secret = cdk_spilman::compute_channel_secret(&receiver, &sender.public_key());
 
         // A v1 keyset id: 8 bytes, hex. Mint keys are arbitrary here because
@@ -310,7 +343,7 @@ pub(crate) mod test_support {
         let funding_token_amount = capacity * 2;
 
         let params_json = serde_json::json!({
-            "mint": "https://mint.example",
+            "mint": mint,
             "unit": "sat",
             "capacity": capacity,
             "funding_token_amount": funding_token_amount,

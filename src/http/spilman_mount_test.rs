@@ -32,6 +32,22 @@ fn state_disabled() -> AppState {
 
 /// A state with the rail enabled and a real ledger on disk.
 fn state_enabled(dir: &std::path::Path) -> AppState {
+    state_with_spilman(dir, None)
+}
+
+/// An enabled rail that **holds a receiver key**, which is what a production
+/// payee always has (`main.rs`) and what `/spilman/params` must advertise.
+fn state_enabled_with_receiver(
+    dir: &std::path::Path,
+    receiver: &cashu::nuts::SecretKey,
+) -> AppState {
+    state_with_spilman(dir, Some(receiver))
+}
+
+fn state_with_spilman(
+    dir: &std::path::Path,
+    receiver: Option<&cashu::nuts::SecretKey>,
+) -> AppState {
     let cfg = Config {
         spilman: SpilmanConfig {
             enabled: true,
@@ -44,6 +60,10 @@ fn state_enabled(dir: &std::path::Path) -> AppState {
     let rail = SpilmanRail::from_config(&cfg.spilman)
         .expect("enabled config is not an error")
         .expect("enabled config must build a rail");
+    let rail = match receiver {
+        Some(key) => rail.with_receiver_key(key.clone()),
+        None => rail,
+    };
     build_state(cfg, Some(Arc::new(rail)))
 }
 
@@ -188,6 +208,160 @@ async fn spilman_paths_respond_when_enabled() {
     );
 }
 
+/// `/spilman/params` must advertise the receiver key the payee will accept, or no
+/// payer can build a channel the payee will ever settle.
+///
+/// This is the assertion the previous suite lacked: `receiver_key_is_acceptable` was
+/// hardcoded `false` and `params` advertised no key at all, so the whole channel
+/// lifecycle was dead on real hardware (HTTP 409 at `POST /spilman/close`) while
+/// every unit test stayed green.
+#[tokio::test]
+async fn params_advertises_the_receiver_key_the_payee_accepts() {
+    use crate::spilman::LedgerPayeeHost;
+    use axum::body::Body;
+    use axum::http::Request;
+    use cdk_spilman::SpilmanHost;
+    use std::sync::Arc as StdArc;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let rail = StdArc::clone(state.spilman.as_ref().expect("rail"));
+
+    let resp = create_test_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/spilman/params")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router call");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("params json");
+
+    // Additive: the fields a payer already reads must still be there.
+    assert_eq!(body["status"], 1, "{body}");
+    assert_eq!(body["in_bytes_per_millisat"], 22_021, "{body}");
+    assert!(
+        body.get("mint_url").is_some(),
+        "params must still name a mint: {body}"
+    );
+
+    let advertised = body["receiver_pubkey"]
+        .as_str()
+        .unwrap_or_else(|| panic!("params must advertise receiver_pubkey: {body}"));
+    let parsed = cashu::nuts::PublicKey::from_hex(advertised)
+        .expect("the advertised key must be a compressed secp256k1 key");
+    assert_eq!(parsed, receiver.public_key(), "{body}");
+
+    // The two ends must agree: what params advertises is what the host accepts, and
+    // the host still refuses somebody else's key.
+    let host_ledger = crate::spilman::ledger::ChannelLedger::open_in_memory().expect("ledger");
+    let host = LedgerPayeeHost::for_close(
+        &host_ledger,
+        &receiver,
+        rail.mint_url().unwrap_or_default(),
+        "{}",
+    );
+    assert!(
+        host.receiver_key_is_acceptable(&parsed),
+        "the advertised key must be one the payee accepts"
+    );
+    assert!(
+        !host.receiver_key_is_acceptable(&cashu::nuts::SecretKey::generate().public_key()),
+        "the payee must still refuse a key it does not hold"
+    );
+}
+
+/// A rail with no receiver key must NOT advertise one. An advertisement that names a
+/// key the payee cannot sign with is worse than none: the payer would open a channel
+/// that can never settle.
+#[tokio::test]
+async fn params_advertises_no_receiver_key_when_the_rail_holds_none() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let resp = create_test_router(state_enabled(dir.path()))
+        .oneshot(
+            Request::builder()
+                .uri("/spilman/params")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router call");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("params json");
+    assert_eq!(
+        body["receiver_pubkey"],
+        serde_json::Value::Null,
+        "a keyless rail must advertise null, not a key it cannot sign with: {body}"
+    );
+}
+
+/// The advertised key must be **stable across a restart**.
+///
+/// A per-boot key would silently break every channel: the payee would come back
+/// advertising a different key, and every channel opened against the old one would be
+/// uncloseable. Production loads the key from `<config dir>/spilman-receiver.key`
+/// (`main.rs`), so this asserts the real path: two boots resolve the same file and
+/// derive the same advertisement.
+#[test]
+fn the_advertised_receiver_key_survives_a_restart() {
+    use crate::spilman::receiver_key;
+    use crate::spilman::SpilmanRail;
+
+    let _guard = crate::config::tests::env_guard();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("TOLLGATE_TEST_CONFIG_DIR", dir.path());
+
+    let path = receiver_key::default_path();
+    assert_eq!(
+        path,
+        dir.path().join(receiver_key::RECEIVER_KEY_FILE),
+        "the key must live in the config dir, next to identities.json"
+    );
+
+    // First boot: creates and persists. Second boot: reloads the same file.
+    let first = receiver_key::load_or_create(&path).expect("first boot");
+    let second = receiver_key::load_or_create(&path).expect("second boot");
+    assert_eq!(
+        first.public_key(),
+        second.public_key(),
+        "the receiver key must be reloaded from disk, not regenerated per boot"
+    );
+
+    let ledger_path = dir.path().join("spilman.db");
+    let advertised = SpilmanRail::open(&ledger_path, 22_021, None)
+        .expect("rail")
+        .with_receiver_key(first.clone())
+        .receiver_pubkey()
+        .expect("rail holds a key");
+    assert_eq!(advertised, first.public_key());
+
+    // A restart: same ledger, same key file, same advertisement.
+    let restarted = SpilmanRail::open(&ledger_path, 22_021, None)
+        .expect("rail")
+        .with_receiver_key(second);
+    assert_eq!(
+        restarted.receiver_pubkey().expect("rail holds a key"),
+        advertised,
+        "a restarted payee must advertise the same receiver key"
+    );
+
+    std::env::remove_var("TOLLGATE_TEST_CONFIG_DIR");
+}
+
 #[tokio::test]
 async fn close_authenticates_before_contacting_mint() {
     let dir = tempfile::tempdir().unwrap();
@@ -219,7 +393,19 @@ async fn close_authenticates_before_contacting_mint() {
 /// asking for the body and the id separately would produce two *different* channels
 /// and quietly assert nothing.
 fn registration() -> (crate::spilman::ChannelRegistrationRequest, String, String) {
-    let req = crate::spilman::registration::test_support::consistent_registration(64, None);
+    registration_for(&cashu::nuts::SecretKey::generate())
+}
+
+/// A registration addressed to `receiver` — the key a keyed rail will accept.
+///
+/// Registration refuses a channel addressed to a key the payee does not hold (and
+/// refuses outright when the payee holds none), so a test that expects a 200 must
+/// choose the key its rail was built with.
+fn registration_for(
+    receiver: &cashu::nuts::SecretKey,
+) -> (crate::spilman::ChannelRegistrationRequest, String, String) {
+    let req =
+        crate::spilman::registration::test_support::consistent_registration_for(receiver, 64, None);
     let body = serde_json::to_string(&req).expect("serialize registration");
     let channel_id = req.channel_id.clone();
     (req, body, channel_id)
@@ -233,8 +419,11 @@ fn registration() -> (crate::spilman::ChannelRegistrationRequest, String, String
 #[tokio::test]
 async fn registering_a_channel_makes_status_find_it() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (_req, body, channel_id) = registration();
+    // A keyed rail, because registration now refuses a channel addressed to any other
+    // key: a keyless fixture could only ever assert the refusal, not the acceptance.
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (_req, body, channel_id) = registration_for(&receiver);
 
     // Before: the channel does not exist, and the payee says so with a 404.
     let before = get(
@@ -285,8 +474,9 @@ async fn registering_a_channel_makes_status_find_it() {
 #[tokio::test]
 async fn a_duplicate_identical_registration_is_idempotent() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (_req, body, _channel_id) = registration();
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (_req, body, _channel_id) = registration_for(&receiver);
 
     let first = post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
     assert_eq!(first.0, StatusCode::OK, "first registration: {}", first.1);
@@ -316,8 +506,9 @@ async fn a_duplicate_identical_registration_is_idempotent() {
 #[tokio::test]
 async fn a_duplicate_with_different_data_is_refused_and_does_not_overwrite() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
-    let (original, original_body, channel_id) = registration();
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let (original, original_body, channel_id) = registration_for(&receiver);
 
     let first = post_json_body(
         create_test_router(state.clone()),
@@ -381,15 +572,17 @@ async fn a_duplicate_with_different_data_is_refused_and_does_not_overwrite() {
 #[tokio::test]
 async fn a_malformed_registration_is_400_and_persists_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
 
     // A registration whose id its own params do not derive. The id is tracked so
     // the "nothing was persisted" assertion below names the *real* id that was
     // offered, not an unrelated one.
-    let (_, valid_body, valid_id) = registration();
+    let (_, valid_body, valid_id) = registration_for(&receiver);
     let unbound_id = "ab".repeat(32);
     let unbound_body = serde_json::to_string(
-        &crate::spilman::registration::test_support::consistent_registration(
+        &crate::spilman::registration::test_support::consistent_registration_for(
+            &receiver,
             64,
             Some(unbound_id.clone()),
         ),
@@ -439,9 +632,10 @@ async fn a_malformed_registration_is_400_and_persists_nothing() {
 #[tokio::test]
 async fn a_registration_in_an_unsupported_unit_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
 
-    let (mut req, _, _) = registration();
+    let (mut req, _, _) = registration_for(&receiver);
     req.params_json = req
         .params_json
         .replace("\"unit\":\"sat\"", "\"unit\":\"usd\"");
@@ -459,5 +653,84 @@ async fn a_registration_in_an_unsupported_unit_is_refused() {
         code,
         StatusCode::BAD_REQUEST,
         "a non-sat channel must be refused at the door: {body}"
+    );
+}
+
+/// A payee that holds **no receiver key** must refuse a registration.
+///
+/// This was a documented carve-out ("cannot settle, cannot lose money") and that was
+/// wrong: by the time this body reaches the payee the funding is already committed in
+/// the channel at the mint, and only the channel's receiver key can release it. Accepting
+/// it therefore strands the payer's money with no error anywhere. Fail closed.
+///
+/// The refusal must be a 400 that *names* the reason, and it must persist nothing —
+/// otherwise a retry would find a channel the payee can never honour.
+#[tokio::test]
+async fn a_keyless_rail_refuses_registration_and_persists_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = state_enabled(dir.path());
+    let receiver = cashu::nuts::SecretKey::generate();
+    let (_req, body, channel_id) = registration_for(&receiver);
+
+    let (code, response) =
+        post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "a payee without a receiver key cannot settle, so it must not accept: {response}"
+    );
+    assert!(
+        response.contains("receiver key"),
+        "the refusal must say what is missing: {response}"
+    );
+
+    let rail = state.spilman.as_ref().expect("rail is enabled");
+    assert!(
+        rail.channel_funding(&channel_id)
+            .expect("read funding")
+            .is_none(),
+        "a refused registration must not leave a channel behind"
+    );
+}
+
+/// A channel funded at a mint this payee is **not configured for** must be refused.
+///
+/// The close swap is issued to `spilman.mint_url`, so a channel funded elsewhere can
+/// never be redeemed here: it would take the payer's funding and be unsettleable. The
+/// mint is trusted operator config, so this comparison is a real check — unlike the
+/// keyset id, which at registration time is only self-consistency (see
+/// `SpilmanRail::enforce_mint_binding`).
+#[tokio::test]
+async fn a_channel_funded_at_another_mint_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let receiver = cashu::nuts::SecretKey::generate();
+    let state = state_enabled_with_receiver(dir.path(), &receiver);
+    let req = crate::spilman::registration::test_support::consistent_registration_addressed_to(
+        &receiver,
+        "https://elsewhere.example",
+        64,
+        None,
+    );
+    let channel_id = req.channel_id.clone();
+    let body = serde_json::to_string(&req).expect("serialize");
+
+    let (code, response) =
+        post_json_body(create_test_router(state.clone()), "/spilman/channel", &body).await;
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "a channel funded at another mint must be refused: {response}"
+    );
+    assert!(
+        response.contains("https://elsewhere.example") && response.contains("https://mint.example"),
+        "the refusal must name both the channel's mint and the configured one: {response}"
+    );
+
+    let rail = state.spilman.as_ref().expect("rail is enabled");
+    assert!(
+        rail.channel_funding(&channel_id)
+            .expect("read funding")
+            .is_none(),
+        "a refused registration must not leave a channel behind"
     );
 }

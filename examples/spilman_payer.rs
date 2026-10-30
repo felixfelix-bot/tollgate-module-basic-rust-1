@@ -5,7 +5,7 @@
 //! only in-process:
 //!
 //! ```text
-//! 1. GET  /spilman/params    read the payee's mint + rate
+//! 1. GET  /spilman/params    read the payee's mint, rate AND receiver pubkey
 //! 2. (mint, over HTTP)       open a channel against that mint, fund it
 //! 3. POST /spilman/channel   register the funding record with the payee
 //! 4. POST /spilman/payment   sign a balance update and pay
@@ -323,6 +323,37 @@ fn seller_mint(advertised: &str, requested: &str) -> Result<String, SpilmanError
     Ok(advertised.to_string())
 }
 
+/// The seller's receiver (payee) pubkey, from `/spilman/params`.
+///
+/// # Why this is read and not generated
+///
+/// The channel's `receiver_pubkey` is the key the **payee** signs the close with.
+/// This driver used to generate a throwaway key here, which meant every channel it
+/// opened was addressed to a key no payee held: the open funded at the mint, the
+/// payment verified (that only needs the *sender* key), and then `POST /spilman/close`
+/// failed — measured as HTTP 409 on real hardware — because the payee could not sign a
+/// close for somebody else's key. The advertised key is the only correct answer.
+///
+/// Returns the canonical 33-byte compressed hex, so the value used to open the channel
+/// and the value used to derive the ECDH channel secret for registration are the same
+/// bytes.
+fn seller_receiver_pubkey(params: &serde_json::Value) -> Result<String, SpilmanError> {
+    let advertised = params
+        .get("receiver_pubkey")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            SpilmanError::Config(
+                "seller receiver_pubkey is missing or not a string; refusing funding".into(),
+            )
+        })?;
+    let key = cashu::nuts::PublicKey::from_hex(advertised).map_err(|e| {
+        SpilmanError::Config(format!(
+            "invalid seller receiver_pubkey: {e}; refusing funding"
+        ))
+    })?;
+    Ok(key.to_hex())
+}
+
 async fn phase_gate(dir: Option<&std::path::Path>, phase: &str) {
     marker(&format!("PAYER_PHASE_READY phase={phase}"));
     if let Some(dir) = dir {
@@ -400,11 +431,15 @@ async fn main() {
         1,
         "GET /spilman/params",
         &format!(
-            "mint_url={advertised_mint} in_bytes_per_millisat={}",
+            "mint_url={advertised_mint} in_bytes_per_millisat={} receiver_pubkey={}",
             params
                 .get("in_bytes_per_millisat")
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            params
+                .get("receiver_pubkey")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
         ),
     );
 
@@ -413,6 +448,11 @@ async fn main() {
     let mint_url = match seller_mint(&advertised_mint, &mint_url) {
         Ok(url) => url,
         Err(e) => fail("validate seller-advertised mint", &e),
+    };
+    // Before any funding: the key every open and registration below is addressed to.
+    let receiver_pubkey = match seller_receiver_pubkey(&params) {
+        Ok(key) => key,
+        Err(e) => fail("validate seller-advertised receiver key", &e),
     };
     marker(&format!("PAYER_MINT_EXTERNAL url={mint_url}"));
 
@@ -460,7 +500,6 @@ async fn main() {
     let keyset_info_json = funded.keyset_info_json.clone();
 
     let sender_secret = SecretKey::generate();
-    let receiver_secret = SecretKey::generate();
 
     let payer_db = tempdir.path().join("payer.sqlite");
     let mut client_host =
@@ -491,7 +530,7 @@ async fn main() {
     let mut opening = match ChannelOpening::prepare(
         &client,
         &token,
-        &receiver_secret.public_key().to_hex(),
+        &receiver_pubkey,
         &sender_secret.public_key().to_hex(),
         expiry,
         &keyset_info_json,
@@ -540,9 +579,8 @@ async fn main() {
     // payer adds both here: it derived the secret at open time, and the payee has no
     // way to recover it from the channel id alone.
     let registration = match ChannelRegistrationRequest::from_registration(&registration_payment)
-        .and_then(|req| {
-            req.with_channel_secret(&sender_secret, &receiver_secret.public_key().to_hex())
-        }) {
+        .and_then(|req| req.with_channel_secret(&sender_secret, &receiver_pubkey))
+    {
         Ok(req) => req.with_keyset_info_json(keyset_info_json.clone()),
         Err(e) => fail("build the registration payload", &e),
     };
@@ -666,7 +704,9 @@ async fn main() {
         Ok(response) => response,
         Err(e) => fail("POST /spilman/close", &e),
     };
-    let receipt = match settlement.complete(&client, &response) {
+    // The channel's own keyset rule (the same 64 passed to `ChannelOpening::prepare`).
+    let accounting = payer::CloseAccounting::new(&keyset_info_json, 64);
+    let receipt = match settlement.complete(&client, &response, &accounting) {
         Ok(receipt) => receipt,
         Err(e) => fail("verify cooperative close", &e),
     };
@@ -687,6 +727,68 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_key_is_selected_from_seller_advertisement() {
+        let seller = SecretKey::generate().public_key().to_hex();
+        let params = serde_json::json!({"receiver_pubkey": seller});
+        assert_eq!(seller_receiver_pubkey(&params).unwrap(), seller);
+    }
+
+    #[test]
+    fn receiver_key_refuses_missing_or_invalid_advertisements() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"receiver_pubkey": null}),
+            serde_json::json!({"receiver_pubkey": 42}),
+            serde_json::json!({"receiver_pubkey": ""}),
+            serde_json::json!({"receiver_pubkey": "not-a-key"}),
+            serde_json::json!({"receiver_pubkey": format!("02{}", "ff".repeat(32))}),
+        ] {
+            let error = seller_receiver_pubkey(&params).expect_err("must refuse funding");
+            assert!(error.to_string().contains("receiver_pubkey"), "{error}");
+        }
+    }
+
+    /// The production path must not mint its own channel receiver key.
+    ///
+    /// This is the regression the random key caused: `SecretKey::generate()` for the
+    /// *receiver* made every channel uncloseable, and no amount of protocol testing
+    /// caught it because the payer half was internally consistent. The driver's only
+    /// permitted ephemeral key is the sender's; the receiver must come from
+    /// `/spilman/params`.
+    ///
+    /// A source-level assertion is deliberate: the failure mode is a *deleted call
+    /// site*, which no behavioural test in this file can observe without a live payee.
+    #[test]
+    fn the_production_path_generates_no_receiver_key() {
+        let source = include_str!("spilman_payer.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+
+        assert_eq!(
+            production.matches("SecretKey::generate()").count(),
+            1,
+            "the driver may generate exactly one ephemeral key (the sender); a \
+             receiver key must come from /spilman/params"
+        );
+        assert!(
+            production.contains("let sender_secret = SecretKey::generate();"),
+            "the single ephemeral key must be the sender's"
+        );
+        for site in [
+            "&receiver_pubkey,",
+            "with_channel_secret(&sender_secret, &receiver_pubkey)",
+        ] {
+            assert!(
+                production.contains(site),
+                "the open and the registration must both use the advertised key ({site} \
+                 missing)"
+            );
+        }
+    }
 
     #[test]
     fn the_usage_names_every_flag_the_lane_passes() {
@@ -787,6 +889,10 @@ mod tests {
         let info = funded.keyset_info_json;
         let token = funding_token(remote.url(), &funded.proofs_json).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        // EPHEMERAL ON PURPOSE, and only here: this test opens a channel against an
+        // in-process mint with no payee on the other end, so there is no advertised key
+        // to honour. The production path (`main`, above) must NEVER generate this key —
+        // see `seller_receiver_pubkey`.
         let sender = SecretKey::generate();
         let receiver = SecretKey::generate();
         let mut host =

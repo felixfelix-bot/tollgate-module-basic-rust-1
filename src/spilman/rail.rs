@@ -109,7 +109,13 @@ impl SpilmanRail {
         self.mint_url.as_deref()
     }
 
-    /// Bytes per millisat in use (both directions).
+    /// The receiver (payee) public key this rail signs channel closes with, if it holds
+    /// one. `None` means this rail cannot settle a channel at all, and must not
+    /// advertise a key it cannot sign with.
+    pub fn receiver_pubkey(&self) -> Option<cashu::nuts::PublicKey> {
+        self.receiver_key.as_ref().map(|key| key.public_key())
+    }
+
     /// Bytes of access a given **raw channel balance** buys at this rail's rate.
     ///
     /// The access path needs the inverse of `authorize_bytes`: it holds a verified
@@ -124,6 +130,7 @@ impl SpilmanRail {
         Ok(self.pricing.bytes_for_millisats(millisats))
     }
 
+    /// Bytes per millisat in use (both directions).
     pub fn in_bytes_per_millisat(&self) -> u64 {
         self.pricing.in_bytes_per_millisat
     }
@@ -160,7 +167,133 @@ impl SpilmanRail {
         // Validate against upstream's own channel reconstruction, then store
         // compare-and-swap. Validation failure means nothing is written.
         let record = crate::spilman::registration::validate_registration(req)?;
+        self.enforce_receiver_binding(&record)?;
         self.ledger.register_channel_funding(&record)
+    }
+
+    /// Refuse a channel addressed to a receiver key this payee does not hold.
+    ///
+    /// # Why registration must consult this
+    ///
+    /// A channel names its `receiver_pubkey` in the params, and every close signature
+    /// this payee produces is made with **its own** receiver key
+    /// (`LedgerPayeeHost::sign_with_tweaked_key`). A channel addressed to any other
+    /// key therefore funds at the mint and then can never settle: the payer's money
+    /// sits in a channel the payee cannot close, and every `POST /spilman/close` is a
+    /// 409. That is the gap this refuses at the door instead of discovering at
+    /// settlement time.
+    ///
+    /// # The `None` case — a keyless rail REFUSES
+    ///
+    /// A rail with no receiver key cannot settle anything, so accepting a registration
+    /// would take the payer's funded channel and strand it: the money is already in the
+    /// channel at the mint by the time this body arrives, and only *this* payee can
+    /// ever release it. There is no honest answer to "is this key yours?" without a
+    /// key, so the answer is a refusal, not a silent acceptance. (This used to be a
+    /// documented carve-out that accepted keyless registrations; that was wrong for
+    /// exactly the reason above.)
+    ///
+    /// Verification-only hosts still exist — `LedgerPayeeHost::new` answers `false` to
+    /// `receiver_key_is_acceptable` — but they are not allowed to *accept a channel*.
+    fn enforce_receiver_binding(
+        &self,
+        record: &crate::spilman::ChannelFundingRecord,
+    ) -> Result<(), SpilmanError> {
+        let refused = |detail: String| SpilmanError::InvalidRegistration {
+            channel_id: record.channel_id.clone(),
+            detail,
+        };
+        let Some(ours) = self.receiver_key.as_ref() else {
+            return Err(refused(
+                "this payee holds no receiver key and cannot settle a channel; \
+                 refusing the registration rather than stranding the funding"
+                    .to_string(),
+            ));
+        };
+        let params: serde_json::Value =
+            serde_json::from_str(&record.params_json).map_err(|e| refused(e.to_string()))?;
+        let offered = params["receiver_pubkey"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no receiver_pubkey".to_string()))?;
+        let offered = cashu::nuts::PublicKey::from_hex(offered)
+            .map_err(|e| refused(format!("receiver_pubkey is not a public key: {e}")))?;
+        let host = LedgerPayeeHost::with_receiver(&self.ledger, ours);
+        if !cdk_spilman::SpilmanHost::receiver_key_is_acceptable(&host, &offered) {
+            return Err(refused(format!(
+                "channel receiver_pubkey {offered} is not this payee's ({}); \
+                 a channel for another key can never be settled here",
+                ours.public_key()
+            )));
+        }
+        self.enforce_mint_binding(&params, record, refused)
+    }
+
+    /// Refuse a channel funded at a mint this payee is not configured for.
+    ///
+    /// # What is honestly checkable here, and what is not
+    ///
+    /// The **mint URL** is trusted: it comes from the operator's `config.json`
+    /// (`spilman.mint_url`), not from the payer. Comparing the channel's `mint` against
+    /// it is a real check, and it is the one that matters — the close swap is issued to
+    /// `self.mint_url`, so a channel funded elsewhere can never be redeemed here.
+    ///
+    /// The **keyset id** is *not* independently trusted at registration time: the only
+    /// keyset bytes in a registration body are supplied by the payer
+    /// (`keyset_info_json`). Comparing `params.keyset_id` against it proves the body is
+    /// self-consistent, which `validate_registration` already establishes, and nothing
+    /// more. The keyset becomes trusted only at close, where it is fetched from the
+    /// configured mint — that is where `mint_and_keyset_is_acceptable` does real work
+    /// (see `prepare_close` / `execute_close_with_network`, both of which build the host
+    /// with `for_close`).
+    ///
+    /// So this delegates to the host's own `mint_and_keyset_is_acceptable` with the
+    /// trusted mint and the body's keyset, and reports the two failures distinctly:
+    /// a mint mismatch is a policy refusal, a keyset inconsistency is a malformed body.
+    fn enforce_mint_binding<E>(
+        &self,
+        params: &serde_json::Value,
+        record: &crate::spilman::ChannelFundingRecord,
+        refused: E,
+    ) -> Result<(), SpilmanError>
+    where
+        E: Fn(String) -> SpilmanError,
+    {
+        let Some(configured) = self.mint_url.as_deref() else {
+            // No configured mint means this rail cannot redeem anything, and it cannot
+            // vouch for the channel's mint either. Same reasoning as the keyless case.
+            return Err(refused(
+                "no mint is configured for this payee; it cannot redeem a channel and \
+                 must not accept one"
+                    .to_string(),
+            ));
+        };
+        let claimed = params["mint"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no mint URL".to_string()))?;
+        let keyset_id = params["keyset_id"]
+            .as_str()
+            .ok_or_else(|| refused("channel params carry no keyset_id".to_string()))?;
+        let keyset_id = keyset_id
+            .parse::<cashu::nuts::Id>()
+            .map_err(|e| refused(format!("keyset_id is not a keyset id: {e}")))?;
+        let key = self
+            .receiver_key
+            .as_ref()
+            .ok_or_else(|| refused("receiver key unavailable".to_string()))?;
+        let host =
+            LedgerPayeeHost::for_close(&self.ledger, key, configured, &record.keyset_info_json);
+        if !cdk_spilman::SpilmanHost::mint_and_keyset_is_acceptable(&host, claimed, &keyset_id) {
+            if claimed != configured {
+                return Err(refused(format!(
+                    "channel was funded at {claimed} but this payee is configured for \
+                     {configured}; it could never redeem the channel"
+                )));
+            }
+            return Err(refused(
+                "channel keyset_id disagrees with the keyset info in the same body".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// The funding record this payee holds for a channel, if any.
@@ -216,7 +349,8 @@ impl SpilmanRail {
         balance: u64,
         signature: &str,
     ) -> Result<LedgerOutcome, SpilmanError> {
-        self.ledger.record_payment_unverified(channel_id, balance, signature)
+        self.ledger
+            .record_payment_unverified(channel_id, balance, signature)
     }
 }
 
@@ -241,44 +375,69 @@ impl SpilmanRail {
     /// Authenticate before any mint I/O; return only the sender's durable receipt.
     /// `None` means authorized, but completion has not yet been persisted.
     pub fn authenticated_close_receipt(
-        &self, payment: &cdk_spilman::Payment,
+        &self,
+        payment: &cdk_spilman::Payment,
     ) -> Result<Option<cdk_spilman::CloseSuccess>, SpilmanError> {
         let id = &payment.channel_id;
-        let funding = self.ledger.get_channel_funding(id)?
+        let funding = self
+            .ledger
+            .get_channel_funding(id)?
             .ok_or_else(|| close_error("unknown channel"))?;
-        let params: serde_json::Value = serde_json::from_str(&funding.params_json).map_err(close_error)?;
+        let params: serde_json::Value =
+            serde_json::from_str(&funding.params_json).map_err(close_error)?;
         if params["mint"].as_str() != self.mint_url.as_deref() {
             return Err(close_error("channel mint does not match configured mint"));
         }
         let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
-            .map_err(close_error)?.try_into().map_err(close_error)?;
+            .map_err(close_error)?
+            .try_into()
+            .map_err(close_error)?;
         let parameters = cdk_spilman::ChannelParameters::from_json_with_channel_secret(
             &funding.params_json,
-            cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json).map_err(close_error)?,
-            secret).map_err(close_error)?;
-        let channel = cdk_spilman::EstablishedChannel::new(parameters,
-            serde_json::from_str(&funding.funding_proofs_json).map_err(close_error)?)
-            .map_err(close_error)?;
+            cdk_spilman::parse_keyset_info_from_json(&funding.keyset_info_json)
+                .map_err(close_error)?,
+            secret,
+        )
+        .map_err(close_error)?;
+        let channel = cdk_spilman::EstablishedChannel::new(
+            parameters,
+            serde_json::from_str(&funding.funding_proofs_json).map_err(close_error)?,
+        )
+        .map_err(close_error)?;
         cdk_spilman::BalanceUpdateMessage {
-            channel_id: id.clone(), amount: payment.balance,
+            channel_id: id.clone(),
+            amount: payment.balance,
             signature: payment.signature.parse().map_err(close_error)?,
-        }.verify_sender_signature(&channel).map_err(close_error)?;
-        let latest = self.ledger.get_latest_payment(id)?
+        }
+        .verify_sender_signature(&channel)
+        .map_err(close_error)?;
+        let latest = self
+            .ledger
+            .get_latest_payment(id)?
             .ok_or_else(|| close_error("missing accepted payment"))?;
         if latest.balance != payment.balance || latest.signature != payment.signature {
-            return Err(close_error("close authorization does not match accepted payment"));
+            return Err(close_error(
+                "close authorization does not match accepted payment",
+            ));
         }
-        let Some((_, state, completed)) = self.ledger.close_journal(id)? else { return Ok(None); };
-        if state != "closed" { return Ok(None); }
+        let Some((_, state, completed)) = self.ledger.close_journal(id)? else {
+            return Ok(None);
+        };
+        if state != "closed" {
+            return Ok(None);
+        }
         let completed: cdk_spilman::CompletedClose = serde_json::from_str(
-            &completed.ok_or_else(|| close_error("closed journal missing completion"))?
-        ).map_err(close_error)?;
+            &completed.ok_or_else(|| close_error("closed journal missing completion"))?,
+        )
+        .map_err(close_error)?;
         if completed.channel_id != *id || completed.balance != payment.balance {
             return Err(close_error("completion binding mismatch"));
         }
         Ok(Some(cdk_spilman::CloseSuccess {
             channel_id: id.clone(),
-            total_value: completed.receiver_sum.checked_add(completed.sender_sum)
+            total_value: completed
+                .receiver_sum
+                .checked_add(completed.sender_sum)
                 .ok_or_else(|| close_error("completion value overflow"))?,
             receiver_sum: completed.receiver_sum,
             sender_sum: completed.sender_sum,
@@ -532,6 +691,7 @@ impl PaymentRail for SpilmanRail {
         //    because authenticity and "not a replay" are different questions: a
         //    re-sent valid signature verifies perfectly and must still not be credited
         //    twice.
-        self.ledger.record_payment_unverified(channel_id, balance, signature)
+        self.ledger
+            .record_payment_unverified(channel_id, balance, signature)
     }
 }

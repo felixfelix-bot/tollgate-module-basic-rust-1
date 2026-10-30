@@ -148,3 +148,56 @@ reach the payee over HTTP and be turned into a `ChannelFundingRecord`. Next step
 registration route — accept params + funding proofs, validate them against the channel id
 (`validate_new_channel_funding`), persist via `save_channel_funding` — in front of the now
 working `record_payment`.
+
+## Phase 5 — receiver-key binding (GREEN, `pr/spilman-receiver-binding`)
+
+- `receiver_pubkey` advertised on `GET /spilman/params`; `SpilmanRail::receiver_pubkey()`
+  exposes the rail's key. `null` when the rail holds none. — done.
+- New persisted key at `<config dir>/spilman-receiver.key` (`src/spilman/receiver_key.rs`):
+  hex, `0600`, `create_new` (race-loser re-reads the winner), refuses corrupt files,
+  reloaded on every boot; `main.rs` exits `EX_CONFIG` if it cannot load. Replaces the
+  merchant-identity derivation, which would have linked the public params endpoint to the
+  Nostr pubkey. — done, 4 unit tests + restart test.
+- `receiver_key_is_acceptable` now compares against our own key (`None` → `false`).
+  `mint_and_keyset_is_acceptable` now compares against the `(mint_url, keyset_json)` the
+  close path was given; `false` when the host was built without them. — done.
+- `SpilmanRail::register_channel` refuses a channel addressed to a foreign receiver key
+  (`enforce_receiver_binding`), so the failure is at the door, not at settlement. — done.
+- Payer `examples/spilman_payer.rs` uses the advertised key; single ephemeral key is the
+  sender's; mint mismatch still fails before funding. — done.
+- RED observed for every layer (see REPORT.md "Evidence"). — done.
+- Full gates green: 327/0 with `test-support,payer-driver`, 306/0 default, clippy 0 both,
+  x86_64-musl build 0. — done.
+- Item 7 fixed as a money bug: keyless rail now REFUSES registration (400) instead of
+  accepting a channel it can never settle; `LedgerPayeeHost::new` still answers false on
+  the verification path. — done, mutation-verified.
+- Item 6: `enforce_mint_binding` calls `mint_and_keyset_is_acceptable` with the trusted
+  configured mint; honest about the keyset half being self-consistency only. — done,
+  mutation-verified.
+- Items 2-5: `scripts/spilman_receiver_binding_e2e.sh` + `~/reports/spilman_receiver_e2e.log`
+  — real module process, real restart (same key), mode 600 on ext4, exit 78 on a
+  read-only config dir, and a real `spilman-payer` process settling (close 200, not 409).
+  18/18 checks. — done.
+- Defect found, not fixed: fee-bearing close receipt (payer aborts after the mint already
+  moved the proofs; payer.rs:285 compares nominal receiver_sum to net balance). — reported.
+- Test-isolation flake in `src/cli/mod.rs` (env var set outside `env_guard`) fixed. — done.
+- Survivors: no physical router/aarch64, no real sats, E2E not in `cargo test`, key
+  rotation undocumented.
+- Item 1 FIXED: fee-bearing close receipts. RED observed first with MINT_FEE_PPK=400
+  (module closed, payer aborted `close receipt does not match signed settlement`).
+  Cause: upstream `receiver_sum` is the NOMINAL sum (bridge.rs:1085
+  inverse_deterministic_value_after_fees(balance).nominal_value), we compared it to the
+  NET signed balance. Fix: `CloseAccounting` in payer.rs; `complete()` now checks the
+  nominal AND that the fee-adjusted net still covers the signed balance. GREEN: 18/18
+  E2E checks at 400 ppk, PAYER_SETTLED receiver_sum=2 sender_sum=122 total=124. — done.
+- Item 2a PROVEN: settlement against a PUBLIC third-party mint (testnut.cashu.space),
+  real HTTP/keysets/fees: PAYER_EXIT=0, PAYER_SETTLED receiver_sum=2 sender_sum=124
+  total=126. New scripts/spilman_public_mint_probe.sh. — done.
+- Item 2b aarch64 musl build works (aarch64-linux-gnu-gcc linker, exit 0, ELF aarch64).
+  Router itself unreachable (no route to host) so no device run exists to report.
+- Item 3 DOCUMENTED: docs/spilman-channel-rail.md §7 backup/rotation/lost-key cost.
+- Item 4 WIRED: tests/spilman_process_e2e.rs invokes the E2E script from cargo test
+  (payer-driver feature, #[ignore]); 1 passed in 143s standalone.
+- E2E script default target dir moved to the worktree target + explicit ~2 GiB free-space
+  precondition; the scratch dir caused an ENOSPC that read as a test failure. — done.
+- Clippy -D warnings green both ways after the CloseAccounting change (needless-borrow).
